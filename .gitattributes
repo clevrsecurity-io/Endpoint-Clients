@@ -1,0 +1,3 @@
+# Prebuilt binaries ship via Releases, not the tree.
+dist/** linguist-generated
+*.md linguist-documentation
