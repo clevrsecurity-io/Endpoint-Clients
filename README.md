@@ -68,10 +68,17 @@ entry governs only what crosses that one server, and the client can take it back
 A **gateway** base URL governs the model hop and not the tool hop, and so does a
 harness whose own configuration points its model traffic at Clevr.
 
-**Codex is read at gateway depth and never at hook depth. It exposes no
-synchronous pre-tool hook, so what Clevr installs for it records and signals but
-cannot deny a call inline. Crediting it with a hook would overstate the control
-by a wide margin.**
+**Codex is read at hook depth since it gained hooks (May 2026).** The ChatGPT
+desktop app runs the same Codex and reads the same `~/.codex/hooks.json`, so one
+install covers both. A Codex config that only carries the model provider block
+is still read at gateway depth: that covers the conversation, not the local
+command.
+
+A Codex hook in the file is reported as installed and **not governing until
+Codex has trusted it**: Codex skips a hook nobody has reviewed and says nothing,
+so the agent reads the trust record (`[hooks.state]` in `~/.codex/config.toml`)
+and the verdict does not move on the file alone. The ChatGPT desktop app is read
+from the same file, at the same depth, under the same rule.
 
 It also lists clients that are **installed but not running**, since a person can
 install an AI client and open it once a month while the machine carries it all

@@ -233,11 +233,15 @@ function hookPaths (home) {
     cursor: [path.join(home, '.cursor', 'hooks.json')],
     'copilot-cli': [path.join(process.env.COPILOT_HOME || path.join(home, '.copilot'), 'hooks', 'clevr.json')],
     augment: [path.join(home, '.augment', 'settings.json')],
-    'gemini-cli': [path.join(home, '.gemini', 'settings.json')]
-    // Codex is deliberately absent. It exposes no synchronous pre-tool hook, so
-    // what we install for it records and signals but cannot deny a call inline.
-    // Reporting it at hook depth would overstate the control by a wide margin;
-    // it is read below at gateway depth instead.
+    'gemini-cli': [path.join(home, '.gemini', 'settings.json')],
+    // Codex gained hooks in May 2026 (PreToolUse denies a call before it runs),
+    // and the ChatGPT desktop app runs the same Codex from the same file. Before
+    // that it was read at gateway depth only, which was the honest depth then.
+    codex: [path.join(home, '.codex', 'hooks.json')],
+    // The ChatGPT desktop app IS that Codex: same binary, same file. Measured
+    // with the hooks trusted and refusing a command inside the app, the app's
+    // own line still read shadow because only the CLI entry looked at the file.
+    chatgpt: [path.join(home, '.codex', 'hooks.json')]
   }
 }
 
@@ -247,9 +251,11 @@ function hookPaths (home) {
 // screen that says nothing right after a successful install reads as a failure,
 // and because "installed but nothing calls it" is the honest state.
 function wrapperGatePaths (home) {
-  return {
-    codex: [path.join(home, '.clevr', 'tools', 'codex', 'clevr-gate.mjs')]
-  }
+  // Empty since Codex gained real hooks: no harness Clevr supports is left with
+  // only a wrapper gate. Kept as a table so the next hook-less harness has a
+  // place to go without reviving the code path.
+  void home
+  return {}
 }
 
 // A harness governed through the gateway rather than a hook. Codex is the case:
@@ -307,7 +313,37 @@ function hookGoverns (file) {
   }
   walk(doc.hooks, 0, false)
   const hit = commands.find(c => c.toLowerCase().includes(MCP_MARKER))
-  return hit ? { governed: true, via: 'hook ' + hit.slice(0, 80) } : { governed: false }
+  // The line quotes the command; a key someone inlined in it must not travel
+  // to the fleet view. Seen on a machine whose hooks carried the env inline.
+  return hit ? { governed: true, via: 'hook ' + hit.replace(/clevr_sk_[A-Za-z0-9_-]+/g, 'clevr_sk_…').slice(0, 80) } : { governed: false }
+}
+
+// Codex runs a hook only after the person has trusted it once (the TUI asks at
+// startup and records a hash per hook under [hooks.state."<file>:<event>:<entry>:
+// <handler>"] in config.toml). Until then the hook is listed and skipped without
+// a word: measured on the ChatGPT desktop app, the command the gate should have
+// refused ran. So a Clevr hook in the file is not governance until its slot has
+// a trust record. The hash is Codex's own and not reproducible here; presence
+// is what can be read, and Codex re-asks by itself when a hook changes.
+const codexEventKey = (event) => event.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
+function codexHooksUntrusted (home, hooksFile) {
+  let doc, toml
+  try { doc = JSON.parse(fs.readFileSync(hooksFile, 'utf8')) } catch { return false }
+  try { toml = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8') } catch { toml = '' }
+  let ours = 0; let missing = 0
+  for (const [event, entries] of Object.entries(doc?.hooks || {})) {
+    if (!Array.isArray(entries)) continue
+    entries.forEach((entry, i) => {
+      (Array.isArray(entry?.hooks) ? entry.hooks : []).forEach((h, j) => {
+        if (!String(h?.command || '').toLowerCase().includes(MCP_MARKER)) return
+        ours++
+        const key = '[hooks.state."' + hooksFile + ':' + codexEventKey(event) + ':' + i + ':' + j + '"]'
+        const at = toml.indexOf(key)
+        if (at < 0 || !/^\s*trusted_hash\s*=\s*"/m.test(toml.slice(at + key.length, at + key.length + 200))) missing++
+      })
+    })
+  }
+  return ours > 0 && missing > 0
 }
 
 function configPointsAtClevr (file) {
@@ -483,7 +519,7 @@ function machineSignals () {
     for (const f of files) {
       if (!fs.existsSync(f)) continue
       const r = hookGoverns(f)
-      if (r.governed) { hook[id] = { ...r, file: f }; break }
+      if (r.governed) { hook[id] = { ...r, file: f, ...((id === 'codex' || id === 'chatgpt') && codexHooksUntrusted(home, f) ? { untrusted: true } : {}) }; break }
     }
   }
   const wrapperGate = {}
@@ -515,8 +551,18 @@ function assess (entry, sig) {
   // Deepest control first. A hook sees every tool call before it runs; an MCP
   // entry sees only what crosses that server; a gateway base URL sees the model
   // hop and not the tool hop. Saying "governed" for all three hid the difference.
-  const hooked = (sig.hook?.[entry.id] || { governed: false }).governed
-  if (hooked) ev.push(`Clevr hook installed in this harness: every tool call is checked before it runs (${sig.hook[entry.id].via})`)
+  const hookSig = sig.hook?.[entry.id] || { governed: false }
+  const hooked = hookSig.governed && !hookSig.untrusted
+  if (hooked) ev.push(`Clevr hook installed in this harness: every tool call is checked before it runs (${hookSig.via})`)
+  // Installed is not trusted. Codex skips a hook nobody has reviewed and says
+  // nothing, so the line says it, and the verdict does not move on the file alone.
+  else if (hookSig.governed && hookSig.untrusted) ev.push(`Clevr hook installed in this harness but not yet trusted by Codex, which skips an untrusted hook without saying so: nothing is checked until someone runs codex once and answers "Trust all and continue" (${hookSig.file})`)
+  // Claude Desktop is two things. Its Chat tab reaches tools over MCP and has no
+  // hook; its Cowork sessions run the Claude Code plugin's hooks. The verdict
+  // stays on what governs the connectors; the Cowork half is stated beside it.
+  if (entry.id === 'claude-desktop' && sig.hook?.['claude-code']?.governed) {
+    ev.push('Cowork sessions in this app run the Claude Code plugin hooks; the Chat tab reaches its connectors over MCP, governed only where the guard wraps them or the gateway fronts them')
+  }
 
   const found = sig.mcp[entry.id] || { governed: false }
   const mcp = found.governed
@@ -976,9 +1022,7 @@ function browserExtensions (home, appData) {
 // reports honestly when the CLI is not on the machine.
 // A harness with no hook and no Clevr MCP server still has controls; saying only "no MCP
 // configuration" hides them behind a shrug.
-const NO_HOOK_REASON = {
-  codex: 'Codex exposes no synchronous pre-tool hook and no user-editable MCP configuration. Its controls are a gate script that records and signals, and a model provider block: clevr setup codex, clevr setup codex-gateway'
-}
+const NO_HOOK_REASON = {}
 
 // Clients the CLI can put the MCP GUARD in front of. The guard wraps the servers
 // this client already has, so a blocked call never reaches the tool. Adding the
@@ -993,7 +1037,10 @@ const HOOK_TARGETS = {
   cursor: 'cursor',
   'copilot-cli': 'copilot-cli',
   augment: 'augment',
-  'gemini-cli': 'gemini-cli'
+  'gemini-cli': 'gemini-cli',
+  codex: 'codex',
+  // The ChatGPT desktop app runs Codex locally and reads the same hooks file.
+  chatgpt: 'codex'
 }
 
 function findClevrCli (home) {

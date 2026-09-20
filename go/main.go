@@ -733,6 +733,7 @@ type mcpFinding struct {
 	Unparsed  bool   `json:"unparsed,omitempty"`
 	Enforcing bool   `json:"enforcing,omitempty"`
 	Names     bool   `json:"names,omitempty"`
+	Untrusted bool   `json:"untrusted,omitempty"`
 }
 type mcpSignals map[string]mcpFinding
 type machine struct {
@@ -809,9 +810,11 @@ func hookPaths(home string) map[string][]string {
 		"copilot-cli": {filepath.Join(copilotHome, "hooks", "clevr.json")},
 		"augment":     {filepath.Join(home, ".augment", "settings.json")},
 		"gemini-cli":  {filepath.Join(home, ".gemini", "settings.json")},
-		// Codex is deliberately absent. It exposes no synchronous pre-tool hook,
-		// so what we install for it records and signals but cannot deny a call
-		// inline. It is read at gateway depth instead.
+		// Codex gained hooks in May 2026, and the ChatGPT desktop app runs the
+		// same Codex from the same file. Kept in step with the .mjs hookPaths.
+		"codex": {filepath.Join(home, ".codex", "hooks.json")},
+		// The ChatGPT desktop app IS that Codex: same binary, same file.
+		"chatgpt": {filepath.Join(home, ".codex", "hooks.json")},
 	}
 }
 
@@ -823,9 +826,9 @@ func hookPaths(home string) map[string][]string {
 // machine, and the verdict does not move for it. Reported because a screen that
 // says nothing right after a successful install reads as a failure.
 func wrapperGatePaths(home string) map[string][]string {
-	return map[string][]string{
-		"codex": {filepath.Join(home, ".clevr", "tools", "codex", "clevr-gate.mjs")},
-	}
+	// Empty since Codex gained real hooks; kept in step with the .mjs table.
+	_ = home
+	return map[string][]string{}
 }
 
 func gatewayConfigPaths(home string) map[string][]string {
@@ -848,6 +851,60 @@ func gatewayGoverns(p string) mcpFinding {
 }
 
 // Reads the hook and plugin declarations, nothing else.
+// Codex runs a hook only after the person has trusted it once (the TUI asks at
+// startup and records a hash per hook under [hooks.state."<file>:<event>:<entry>:
+// <handler>"] in config.toml). Until then the hook is listed and skipped without
+// a word, so a Clevr hook in the file is not governance until its slot has a
+// trust record. The hash is Codex's own; presence is what can be read. Kept in
+// step with codexHooksUntrusted in the .mjs agent.
+var clevrKeyRe = regexp.MustCompile(`clevr_sk_[A-Za-z0-9_-]+`)
+var codexCamel = regexp.MustCompile(`([a-z0-9])([A-Z])`)
+var codexTrustedHash = regexp.MustCompile(`(?m)^\s*trusted_hash\s*=\s*"`)
+
+func codexHooksUntrusted(home, hooksFile string) bool {
+	b, err := os.ReadFile(hooksFile)
+	if err != nil {
+		return false
+	}
+	var doc struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if json.Unmarshal(b, &doc) != nil {
+		return false
+	}
+	tomlBytes, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	toml := string(tomlBytes)
+	ours, missing := 0, 0
+	for event, entries := range doc.Hooks {
+		for i, entry := range entries {
+			for j, h := range entry.Hooks {
+				if !strings.Contains(strings.ToLower(h.Command), mcpMarker) {
+					continue
+				}
+				ours++
+				key := fmt.Sprintf("[hooks.state.\"%s:%s:%d:%d\"]", hooksFile, strings.ToLower(codexCamel.ReplaceAllString(event, "${1}_${2}")), i, j)
+				at := strings.Index(toml, key)
+				if at < 0 {
+					missing++
+					continue
+				}
+				rest := toml[at+len(key):]
+				if len(rest) > 200 {
+					rest = rest[:200]
+				}
+				if !codexTrustedHash.MatchString(rest) {
+					missing++
+				}
+			}
+		}
+	}
+	return ours > 0 && missing > 0
+}
+
 func hookGoverns(p string) mcpFinding {
 	b, err := os.ReadFile(p)
 	if err != nil {
@@ -880,7 +937,9 @@ func hookGoverns(p string) mcpFinding {
 				if len(c) > 80 {
 					c = c[:80]
 				}
-				return mcpFinding{Governed: true, Via: "hook " + c}
+				// A key someone inlined in the command must not travel to the fleet
+				// view. Kept in step with the .mjs agent.
+				return mcpFinding{Governed: true, Via: "hook " + clevrKeyRe.ReplaceAllString(c, "clevr_sk_…")}
 			}
 		}
 	}
@@ -1180,6 +1239,9 @@ func machineSignals() machine {
 		for _, f := range files {
 			if r := hookGoverns(f); r.Governed {
 				r.File = f
+				if (id == "codex" || id == "chatgpt") && codexHooksUntrusted(home, f) {
+					r.Untrusted = true
+				}
 				hooks[id] = r
 				break
 			}
@@ -1252,9 +1314,20 @@ func assess(e catEntry, sig machine) (monitored bool, via string, evidence []str
 	// Deepest control first: a hook sees every tool call before it runs, an MCP
 	// entry sees only what crosses that server, a gateway base URL sees the model
 	// hop and not the tool hop.
-	hooked := sig.Hook[e.id].Governed
+	hookSig := sig.Hook[e.id]
+	hooked := hookSig.Governed && !hookSig.Untrusted
 	if hooked {
-		ev = append(ev, fmt.Sprintf("Clevr hook installed in this harness: every tool call is checked before it runs (%s)", sig.Hook[e.id].Via))
+		ev = append(ev, fmt.Sprintf("Clevr hook installed in this harness: every tool call is checked before it runs (%s)", hookSig.Via))
+	} else if hookSig.Governed && hookSig.Untrusted {
+		// Installed is not trusted. Codex skips a hook nobody has reviewed and
+		// says nothing, so the line says it, and the verdict does not move.
+		ev = append(ev, fmt.Sprintf("Clevr hook installed in this harness but not yet trusted by Codex, which skips an untrusted hook without saying so: nothing is checked until someone runs codex once and answers \"Trust all and continue\" (%s)", hookSig.File))
+	}
+	// Claude Desktop is two things: the Chat tab (MCP connectors, no hook) and
+	// Cowork sessions, which run the Claude Code plugin hooks. Kept in step with
+	// the .mjs assess.
+	if e.id == "claude-desktop" && sig.Hook["claude-code"].Governed {
+		ev = append(ev, "Cowork sessions in this app run the Claude Code plugin hooks; the Chat tab reaches its connectors over MCP, governed only where the guard wraps them or the gateway fronts them")
 	}
 	found := sig.MCP[e.id]
 	mcp := found.Governed
