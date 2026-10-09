@@ -39,7 +39,7 @@ import (
 	"unicode/utf16"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 var (
 	clevrURL   = os.Getenv("CLEVR_URL")
@@ -69,8 +69,11 @@ func hostOf(u string) string {
 
 type catEntry struct {
 	id, label, kind string
-	re              *regexp.Regexp
+	re              *regexp.Regexp // nil: reached through an identity only
 	inArgs          bool
+	names           []string       // application names an identity answers to
+	unless          *regexp.Regexp // a maker this name never belongs to
+	family          []string       // a maker's products, for its helpers
 }
 
 // AI-client catalog. Ordered specific -> generic; each process is assigned to the
@@ -81,24 +84,54 @@ type catEntry struct {
 // security screen. inArgs is the deliberate exception, for entries whose identity
 // genuinely lives in the arguments because the executable is just an interpreter.
 var catalog = []catEntry{
-	{"claude-code", "Claude Code (CLI)", "cli-agent", regexp.MustCompile(`(?i)claude[-_ ]?code|@anthropic-ai[/\\]claude-code`), true},
-	{"cursor", "Cursor", "ide-agent", regexp.MustCompile(`(?i)(?:^|[/\\ ])cursor(?:\.exe| helper|$|[/\\ ])`), false},
-	{"windsurf", "Windsurf", "ide-agent", regexp.MustCompile(`(?i)windsurf`), false},
-	{"chatgpt", "ChatGPT desktop", "desktop-assistant", regexp.MustCompile(`(?i)chatgpt`), false},
-	{"claude-desktop", "Claude Desktop", "desktop-assistant", regexp.MustCompile(`(?i)(?:^|[/\\ ])claude(?:\.exe| helper|$|[/\\ ])`), false},
+	{id: "claude-code", label: "Claude Code (CLI)", kind: "cli-agent", re: regexp.MustCompile(`(?i)claude[-_ ]?code|@anthropic-ai[/\\]claude-code`), inArgs: true, names: nil, unless: nil, family: nil},
+	{id: "cursor", label: "Cursor", kind: "ide-agent", re: regexp.MustCompile(`(?i)(?:^|[/\\ ])cursor(?:\.exe| helper|$|[/\\ ])`), inArgs: false, names: []string{"cursor"}, unless: nil, family: nil},
+	{id: "windsurf", label: "Windsurf", kind: "ide-agent", re: regexp.MustCompile(`(?i)windsurf`), inArgs: false, names: []string{"windsurf"}, unless: nil, family: nil},
+	// The ChatGPT browser before the ChatGPT application, whose pattern is any
+	// path naming ChatGPT.
+	{id: "chatgpt-atlas", label: "ChatGPT Atlas (AI browser)", kind: "ai-browser", re: regexp.MustCompile(`(?i)chatgpt[ ._-]?atlas`), inArgs: false, names: []string{"chatgpt atlas"}, unless: nil, family: nil},
+	{id: "chatgpt", label: "ChatGPT desktop", kind: "desktop-assistant", re: regexp.MustCompile(`(?i)chatgpt`), inArgs: false, names: []string{"chatgpt", "chatgpt classic"}, unless: nil, family: nil},
+	{id: "claude-desktop", label: "Claude Desktop", kind: "desktop-assistant", re: regexp.MustCompile(`(?i)(?:^|[/\\ ])claude(?:\.exe| helper|$|[/\\ ])`), inArgs: false, names: []string{"claude"}, unless: nil, family: nil},
+	{id: "perplexity", label: "Perplexity", kind: "desktop-assistant", re: regexp.MustCompile(`(?i)(?:^|[/\\ ])perplexity(?:\.exe| helper|$|[/\\ ])`), inArgs: false, names: []string{"perplexity"}, unless: nil, family: nil},
+	{id: "comet", label: "Comet (AI browser)", kind: "ai-browser", re: regexp.MustCompile(`(?i)[/\\]Comet\.app[/\\]|(?:^|[/\\])comet\.exe$`), inArgs: false, names: []string{"comet"}, unless: nil, family: nil},
+	// Microsoft's assistant before the GitHub command line, which answers to the
+	// same word: the application is a bundle (Copilot.app) on a Mac.
+	{id: "microsoft-copilot", label: "Microsoft Copilot", kind: "desktop-assistant", re: regexp.MustCompile(`(?i)[/\\]Copilot\.app[/\\]|(?:^|[/\\])(?:microsoft[ .]?copilot|m365copilot)(?:\.exe)?$`), inArgs: false, names: []string{"microsoft copilot", "copilot"}, unless: nil, family: nil},
+	// Codex's own agent that controls the desktop, installed under ~/.codex.
+	{id: "codex-computer-use", label: "Codex computer use (controls the desktop)", kind: "cli-agent", re: regexp.MustCompile(`(?i)[/\\]Codex Computer Use\.app[/\\]`), inArgs: false, names: []string{"codex computer use"}, unless: nil, family: nil},
 	// The command-line harnesses come AFTER the desktop applications on purpose.
 	// ChatGPT desktop ships a binary literally named `codex` inside its own
 	// bundle, and a machine carrying one product must not be reported as two.
 	// Anchored to the END of the executable path: a harness is a binary CALLED
 	// codex, not any path containing the word.
-	{"gemini-cli", "Gemini CLI", "cli-agent", regexp.MustCompile(`(?i)(?:^|[/\\])gemini(?:\.exe)?$`), false},
-	{"copilot-cli", "GitHub Copilot CLI", "cli-agent", regexp.MustCompile(`(?i)(?:^|[/\\])copilot(?:\.exe)?$`), false},
-	{"augment", "Augment", "cli-agent", regexp.MustCompile(`(?i)(?:^|[/\\])(?:auggie|augment)(?:\.exe)?$`), false},
-	{"codex", "Codex (CLI)", "cli-agent", regexp.MustCompile(`(?i)(?:^|[/\\])codex(?:\.exe)?$`), false},
-	{"ollama", "Ollama (local model)", "local-model", regexp.MustCompile(`(?i)ollama`), false},
-	{"lmstudio", "LM Studio (local model)", "local-model", regexp.MustCompile(`(?i)lm[-_ ]?studio`), false},
-	{"py-agent", "Python agent", "custom-agent", regexp.MustCompile(`(?i)python[0-9.]*\b.*(langchain|langgraph|crewai|autogen|llama[_-]?index|pydantic_ai|smolagents|@?modelcontextprotocol[/\\]server)`), true},
-	{"node-agent", "Node agent", "custom-agent", regexp.MustCompile(`(?i)\bnode\b.*(langchain|@langchain|crewai|@modelcontextprotocol[/\\]server|ai-sdk|@openai[/\\]agents)`), true},
+	{id: "gemini-cli", label: "Gemini CLI", kind: "cli-agent", re: regexp.MustCompile(`(?i)(?:^|[/\\])gemini(?:\.exe)?$`), inArgs: false, names: nil, unless: nil, family: nil},
+	// A copilot.exe that Microsoft signed is its assistant, not this.
+	{id: "copilot-cli", label: "GitHub Copilot CLI", kind: "cli-agent", re: regexp.MustCompile(`(?i)(?:^|[/\\])copilot(?:\.exe)?$`), inArgs: false, names: nil, unless: regexp.MustCompile(`(?i)\bMicrosoft\b`), family: nil},
+	{id: "augment", label: "Augment", kind: "cli-agent", re: regexp.MustCompile(`(?i)(?:^|[/\\])(?:auggie|augment)(?:\.exe)?$`), inArgs: false, names: nil, unless: nil, family: nil},
+	{id: "codex", label: "Codex (CLI)", kind: "cli-agent", re: regexp.MustCompile(`(?i)(?:^|[/\\])codex(?:\.exe)?$`), inArgs: false, names: nil, unless: nil, family: nil},
+	{id: "goose", label: "Goose", kind: "cli-agent", re: regexp.MustCompile(`(?i)(?:^|[/\\])goose(?:\.exe)?$|[/\\]Goose\.app[/\\]`), inArgs: false, names: []string{"goose"}, unless: nil, family: nil},
+	{id: "opencode", label: "OpenCode", kind: "cli-agent", re: regexp.MustCompile(`(?i)(?:^|[/\\])opencode(?:\.exe)?$`), inArgs: false, names: []string{"opencode"}, unless: nil, family: nil},
+	{id: "aider", label: "Aider", kind: "cli-agent", re: regexp.MustCompile(`(?i)(?:^|[/\\ ])aider(?:\.exe)?(?:\s|$)|\s-m\s+aider\b`), inArgs: true, names: nil, unless: nil, family: nil},
+	{id: "kiro", label: "Kiro", kind: "ide-agent", re: regexp.MustCompile(`(?i)[/\\]Kiro\.app[/\\]|(?:^|[/\\])kiro(?:\.exe)?$`), inArgs: false, names: []string{"kiro"}, unless: nil, family: nil},
+	{id: "trae", label: "Trae", kind: "ide-agent", re: regexp.MustCompile(`(?i)[/\\]Trae\.app[/\\]|(?:^|[/\\])trae(?:\.exe)?$`), inArgs: false, names: []string{"trae"}, unless: nil, family: nil},
+	{id: "ollama", label: "Ollama (local model)", kind: "local-model", re: regexp.MustCompile(`(?i)ollama`), inArgs: false, names: []string{"ollama"}, unless: nil, family: nil},
+	{id: "lmstudio", label: "LM Studio (local model)", kind: "local-model", re: regexp.MustCompile(`(?i)lm[-_ ]?studio`), inArgs: false, names: []string{"lm studio"}, unless: nil, family: nil},
+	{id: "jan", label: "Jan (local model)", kind: "local-model", re: regexp.MustCompile(`(?i)[/\\]Jan\.app[/\\]|(?:^|[/\\])jan(?:\.exe)?$`), inArgs: false, names: []string{"jan"}, unless: nil, family: nil},
+	{id: "gpt4all", label: "GPT4All (local model)", kind: "local-model", re: regexp.MustCompile(`(?i)gpt4all`), inArgs: false, names: []string{"gpt4all"}, unless: nil, family: nil},
+	{id: "msty", label: "Msty (local model)", kind: "local-model", re: regexp.MustCompile(`(?i)[/\\]Msty\.app[/\\]|(?:^|[/\\])msty(?:\.exe)?$`), inArgs: false, names: []string{"msty"}, unless: nil, family: nil},
+	{id: "anythingllm", label: "AnythingLLM", kind: "desktop-assistant", re: regexp.MustCompile(`(?i)anythingllm`), inArgs: false, names: []string{"anythingllm"}, unless: nil, family: nil},
+	// Applications that carry AI among other things: listed, never counted as
+	// shadow AI, since whether their AI is used cannot be seen from the machine.
+	{id: "raycast", label: "Raycast (AI built in)", kind: "ai-feature", re: regexp.MustCompile(`(?i)[/\\]Raycast\.app[/\\]|(?:^|[/\\])raycast(?:\.exe)?$`), inArgs: false, names: []string{"raycast"}, unless: nil, family: nil},
+	{id: "warp", label: "Warp (AI built in)", kind: "ai-feature", re: regexp.MustCompile(`(?i)[/\\]Warp\.app[/\\]|(?:^|[/\\])warp(?:\.exe)?$`), inArgs: false, names: []string{"warp"}, unless: nil, family: nil},
+	{id: "zed", label: "Zed (AI built in)", kind: "ai-feature", re: regexp.MustCompile(`(?i)[/\\]Zed\.app[/\\]|(?:^|[/\\])zed(?:\.exe)?$`), inArgs: false, names: []string{"zed"}, unless: nil, family: nil},
+	{id: "py-agent", label: "Python agent", kind: "custom-agent", re: regexp.MustCompile(`(?i)python[0-9.]*\b.*(langchain|langgraph|crewai|autogen|llama[_-]?index|pydantic_ai|smolagents|@?modelcontextprotocol[/\\]server)`), inArgs: true, names: nil, unless: nil, family: nil},
+	{id: "node-agent", label: "Node agent", kind: "custom-agent", re: regexp.MustCompile(`(?i)\bnode\b.*(langchain|@langchain|crewai|@modelcontextprotocol[/\\]server|ai-sdk|@openai[/\\]agents)`), inArgs: true, names: nil, unless: nil, family: nil},
+	// Reached through an identity only: a maker whose every product is AI. Its
+	// helpers belong to its product when the product is there (family).
+	{id: "openai-app", label: "An application signed by OpenAI", kind: "desktop-assistant", re: nil, inArgs: false, names: nil, unless: nil, family: []string{"chatgpt", "chatgpt-atlas", "codex", "codex-computer-use"}},
+	{id: "anthropic-app", label: "An application signed by Anthropic", kind: "desktop-assistant", re: nil, inArgs: false, names: nil, unless: nil, family: []string{"claude-desktop", "claude-code"}},
+	{id: "mistral-app", label: "An application signed by Mistral AI", kind: "desktop-assistant", re: nil, inArgs: false, names: nil, unless: nil, family: []string{}},
 }
 
 type proc struct{ pid, cmd, exe string }
@@ -632,6 +665,24 @@ func installPaths(home, appData string) map[string][]string {
 		"codex":          {filepath.Join(home, ".codex")},
 		"ollama":         join(apps("Ollama"), []string{filepath.Join(home, ".ollama")}),
 		"lmstudio":       join(apps("LM Studio"), []string{filepath.Join(home, ".lmstudio")}, sup("LM Studio")),
+		// The applications added on 2026-10-09, as in the Node agent.
+		"chatgpt-atlas":      apps("ChatGPT Atlas"),
+		"perplexity":         join(apps("Perplexity"), sup("Perplexity")),
+		"comet":              apps("Comet"),
+		"microsoft-copilot":  apps("Copilot"),
+		"codex-computer-use": {filepath.Join(home, ".codex", "computer-use", "Codex Computer Use.app")},
+		"goose":              join(apps("Goose"), []string{filepath.Join(home, ".config", "goose")}),
+		"opencode":           {filepath.Join(home, ".config", "opencode")},
+		"aider":              {filepath.Join(home, ".aider.conf.yml")},
+		"kiro":               join(apps("Kiro"), []string{filepath.Join(home, ".kiro")}),
+		"trae":               join(apps("Trae"), sup("Trae")),
+		"jan":                join(apps("Jan"), sup("Jan")),
+		"gpt4all":            join(apps("GPT4All"), sup("nomic.ai", "GPT4All")),
+		"msty":               join(apps("Msty"), sup("Msty")),
+		"anythingllm":        join(apps("AnythingLLM"), sup("anythingllm-desktop")),
+		"raycast":            apps("Raycast"),
+		"warp":               apps("Warp"),
+		"zed":                apps("Zed"),
 	}
 }
 
@@ -1380,6 +1431,10 @@ func assess(e catEntry, sig machine) (monitored bool, via string, evidence []str
 		ev = append(ev, "Local model runner: no cloud gateway to route through; govern its tool use via a local MCP proxy")
 		return false, "local", ev
 	}
+	if e.kind == "ai-feature" {
+		ev = append(ev, "An application with AI built in: whether its AI is used cannot be seen from the machine, so it is listed, not counted as shadow AI")
+		return false, "feature", ev
+	}
 	// Stated after the verdict lines and never counted into them: a gate nobody
 	// calls governs nothing.
 	if g, ok := sig.WrapperGate[e.id]; ok {
@@ -1729,21 +1784,58 @@ func buildReport() report {
 	// them, don't list the app ten times). First match is the representative.
 	order := []string{}
 	byID := map[string]*client{}
+	named := map[string]bool{}
+	seenBy := map[string]string{}
 	for _, p := range procs {
-		for _, e := range catalog {
-			target := p.cmd
-			if !e.inArgs {
-				target = p.exe
+		e, by, ok := entryOfProcess(p)
+		if !ok {
+			continue
+		}
+		c, exists := byID[e.id]
+		if !exists {
+			mon, via, ev := assess(e, sig)
+			c = &client{ID: e.id, Label: e.label, Kind: e.kind, PID: p.pid, Monitored: mon, Via: via, Evidence: ev, Running: true}
+			byID[e.id] = c
+			order = append(order, e.id)
+		}
+		c.Procs++
+		if by == "" {
+			named[e.id] = true
+		} else if _, seen := seenBy[e.id]; !seen {
+			name := p.exe
+			if name == "" {
+				name = p.cmd
 			}
-			if e.re.MatchString(target) {
-				c, ok := byID[e.id]
-				if !ok {
-					mon, via, ev := assess(e, sig)
-					c = &client{ID: e.id, Label: e.label, Kind: e.kind, PID: p.pid, Monitored: mon, Via: via, Evidence: ev, Running: true}
-					byID[e.id] = c
-					order = append(order, e.id)
+			if name == "" {
+				name = "?"
+			}
+			seenBy[e.id] = fmt.Sprintf("Recognised by %s, running as %s", by, filepath.Base(name))
+		}
+	}
+	// A client none of whose processes answered to its name says how it was
+	// recognised; one whose helper was found by its bundle needs no such line.
+	for id, line := range seenBy {
+		if !named[id] {
+			byID[id].Evidence = append([]string{line}, byID[id].Evidence...)
+		}
+	}
+	// A maker's helpers belong to its product when the product is there.
+	for _, e := range catalog {
+		maker, ok := byID[e.id]
+		if e.family == nil || !ok {
+			continue
+		}
+		for _, id := range e.family {
+			if product, ok := byID[id]; ok {
+				product.Procs += maker.Procs
+				delete(byID, e.id)
+				kept := order[:0]
+				for _, o := range order {
+					if o != e.id {
+						kept = append(kept, o)
+					}
 				}
-				c.Procs++
+				order = kept
 				break
 			}
 		}
@@ -1786,7 +1878,7 @@ func buildReport() report {
 			if c.Via == "hook" {
 				hooked++
 			}
-		} else if c.Via != "local" {
+		} else if c.Via != "local" && c.Via != "feature" {
 			if c.Running {
 				shadow++
 			} else {
@@ -1830,6 +1922,8 @@ func printReport(r report) {
 			tag = "GOVERNED"
 		} else if c.Kind == "local-model" {
 			tag = "LOCAL   "
+		} else if c.Kind == "ai-feature" {
+			tag = "AI APP  "
 		}
 		depth := ""
 		if c.Monitored {
@@ -2017,6 +2111,10 @@ func runOnce() {
 }
 
 func main() {
+	// --identify <path>: how this agent recognises one executable or application.
+	if hasArg("--identify") {
+		identifyAndExit()
+	}
 	runOnce()
 	if hasArg("--watch") {
 		secs := 300
@@ -2360,4 +2458,323 @@ func printSkills(skills []skillOnMachine) {
 	}
 	fmt.Println("Read, never written. Each skill is listed with the version of its files; whether that")
 	fmt.Println("version is approved, and which agents may load it, is answered in Clevr.")
+}
+
+// ── Who an executable is, beyond its name ────────────────────────────────────
+// The same reading as the Node agent's identityOf: an executable the names miss
+// is read once more, from what the file carries and a rename keeps. macOS: the
+// application it belongs to (Info.plist) and the organisation that signed it
+// (codesign). Windows: the product, original file name and company its version
+// information declares. Linux: names only. Read, never written.
+
+type identity struct {
+	Name   *string  `json:"name"`
+	Names  []string `json:"names"`
+	Org    *string  `json:"org"`
+	Bundle *string  `json:"bundle"`
+	Signed bool     `json:"signed"`
+}
+
+type signerRule struct {
+	re *regexp.Regexp
+	id string
+}
+
+var signers = []signerRule{
+	{regexp.MustCompile(`(?i)\bAnysphere\b`), "cursor"},
+	{regexp.MustCompile(`(?i)\b(?:Exafunction|Codeium)\b`), "windsurf"},
+	{regexp.MustCompile(`(?i)\bPerplexity\b`), "perplexity"},
+	{regexp.MustCompile(`(?i)\bOllama\b`), "ollama"},
+	{regexp.MustCompile(`(?i)\bElement Labs\b`), "lmstudio"},
+	{regexp.MustCompile(`(?i)\bOpenAI\b`), "openai-app"},
+	{regexp.MustCompile(`(?i)\bAnthropic\b`), "anthropic-app"},
+	{regexp.MustCompile(`(?i)\bMistral AI\b`), "mistral-app"},
+}
+
+var systemPrefixes = []string{"/System/", "/sbin/", "/bin/", "/Library/Apple/", "/private/var/db/", "/Library/Developer/CommandLineTools/"}
+var windowsDir = regexp.MustCompile(`(?i)^[A-Za-z]:\\Windows\\`)
+
+func isSystemExe(f string) bool {
+	for _, x := range systemPrefixes {
+		if strings.HasPrefix(f, x) {
+			return true
+		}
+	}
+	if strings.HasPrefix(f, "/usr/") && !strings.HasPrefix(f, "/usr/local/") {
+		return true
+	}
+	return windowsDir.MatchString(f)
+}
+
+// Both streams: codesign says what it found on stderr, and succeeds.
+func runQuiet(timeout time.Duration, name string, args ...string) string {
+	cmd := exec.Command(name, args...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		return ""
+	}
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		_ = cmd.Process.Kill()
+		<-done
+	}
+	return out.String()
+}
+
+var plistNoValue = regexp.MustCompile(`^(?:<stdin>|Error|.*: )`)
+
+func plistKey(bundle, key string) string {
+	v := strings.TrimSpace(runQuiet(5*time.Second, "/usr/bin/plutil", "-extract", key, "raw", "-o", "-", filepath.Join(bundle, "Contents", "Info.plist")))
+	if v == "" || plistNoValue.MatchString(v) || strings.Contains(v, "No value at that key path") {
+		return ""
+	}
+	return v
+}
+
+func bundleOf(exe string) string {
+	i := strings.LastIndex(exe, ".app/")
+	if i > 0 {
+		return exe[:i+4]
+	}
+	return ""
+}
+
+var authorityLine = regexp.MustCompile(`(?m)^Authority=(.+)$`)
+var authorityKind = regexp.MustCompile(`^(?:Developer ID Application|Apple Development|Apple Distribution|Mac App Distribution|3rd Party Mac Developer Application): `)
+var authorityTeam = regexp.MustCompile(` \([A-Z0-9]{10}\)$`)
+
+func signerOf(file string) string {
+	m := authorityLine.FindStringSubmatch(runQuiet(5*time.Second, "/usr/bin/codesign", "-dv", "--verbose=2", file))
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(authorityTeam.ReplaceAllString(authorityKind.ReplaceAllString(m[1], ""), ""))
+}
+
+type winIdent struct {
+	Pid         string `json:"pid"`
+	Path        string `json:"path"`
+	Company     string `json:"company"`
+	Product     string `json:"product"`
+	Original    string `json:"original"`
+	Description string `json:"description"`
+}
+
+var winIdentities map[string]winIdent
+
+func windowsIdentities() map[string]winIdent {
+	if winIdentities != nil {
+		return winIdentities
+	}
+	winIdentities = map[string]winIdent{}
+	ps := `Get-Process | Where-Object { $_.Path } | ForEach-Object { $v = $_.MainModule.FileVersionInfo; [pscustomobject]@{ pid = [string]$_.Id; path = $_.Path; company = $v.CompanyName; product = $v.ProductName; original = $v.OriginalFilename; description = $v.FileDescription } } | ConvertTo-Json -Compress`
+	raw := strings.TrimSpace(runQuiet(20*time.Second, "powershell", "-NoProfile", "-NonInteractive", "-Command", ps))
+	var list []winIdent
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		var one winIdent
+		if json.Unmarshal([]byte(raw), &one) == nil {
+			list = []winIdent{one}
+		}
+	}
+	for _, x := range list {
+		if x.Pid != "" {
+			winIdentities[x.Pid] = x
+		}
+	}
+	return winIdentities
+}
+
+var exeSuffix = regexp.MustCompile(`(?i)\.exe$`)
+
+func uniqueNonEmpty(vals ...string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, v := range vals {
+		v = strings.TrimSpace(exeSuffix.ReplaceAllString(v, ""))
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+func strp(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func winIdentity(w winIdent) *identity {
+	names := uniqueNonEmpty(w.Product, w.Original, w.Description)
+	if len(names) == 0 && w.Company == "" {
+		return nil
+	}
+	var name *string
+	if len(names) > 0 {
+		name = strp(names[0])
+	}
+	return &identity{Name: name, Names: names, Org: strp(w.Company), Bundle: nil, Signed: false}
+}
+
+var identityCache = map[string]*identity{}
+
+func identityOf(p proc) *identity {
+	if runtime.GOOS == "windows" {
+		w, ok := windowsIdentities()[p.pid]
+		if !ok || isSystemExe(w.Path) {
+			return nil
+		}
+		return winIdentity(w)
+	}
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	exe := p.exe
+	if exe == "" || !strings.HasPrefix(exe, "/") || isSystemExe(exe) {
+		return nil
+	}
+	if v, ok := identityCache[exe]; ok {
+		return v
+	}
+	bundle := bundleOf(exe)
+	names := []string{}
+	id := ""
+	if bundle != "" {
+		names = uniqueNonEmpty(plistKey(bundle, "CFBundleDisplayName"), plistKey(bundle, "CFBundleName"))
+		id = plistKey(bundle, "CFBundleIdentifier")
+	}
+	org := signerOf(exe)
+	var out *identity
+	if len(names) > 0 || org != "" {
+		var name *string
+		if len(names) > 0 {
+			name = strp(names[0])
+		}
+		out = &identity{Name: name, Names: names, Org: strp(org), Bundle: strp(id), Signed: org != ""}
+	}
+	identityCache[exe] = out
+	return out
+}
+
+func identityOfFile(file string) *identity {
+	if runtime.GOOS == "windows" {
+		ps := `$v = (Get-Item -LiteralPath '` + strings.ReplaceAll(file, "'", "''") + `').VersionInfo; [pscustomobject]@{ company = $v.CompanyName; product = $v.ProductName; original = $v.OriginalFilename; description = $v.FileDescription } | ConvertTo-Json -Compress`
+		var w winIdent
+		if json.Unmarshal([]byte(strings.TrimSpace(runQuiet(20*time.Second, "powershell", "-NoProfile", "-NonInteractive", "-Command", ps))), &w) != nil {
+			return nil
+		}
+		return winIdentity(w)
+	}
+	return identityOf(proc{exe: file})
+}
+
+func catalogByID(id string) (catEntry, bool) {
+	for _, e := range catalog {
+		if e.id == id {
+			return e, true
+		}
+	}
+	return catEntry{}, false
+}
+
+func entryOfIdentity(ident *identity) (catEntry, string, bool) {
+	if ident == nil {
+		return catEntry{}, "", false
+	}
+	// The first entry naming any of the identity's names, and the identity's
+	// first name that entry knows, as the Node agent picks them.
+	for _, e := range catalog {
+		for _, have := range ident.Names {
+			for _, n := range e.names {
+				if strings.ToLower(have) == n {
+					return e, "its application name (" + have + ")", true
+				}
+			}
+		}
+	}
+	if ident.Org != nil {
+		for _, sr := range signers {
+			if sr.re.MatchString(*ident.Org) {
+				if e, ok := catalogByID(sr.id); ok {
+					how := "its declared maker"
+					if ident.Signed {
+						how = "its signature"
+					}
+					return e, how + " (" + *ident.Org + ")", true
+				}
+			}
+		}
+	}
+	return catEntry{}, "", false
+}
+
+func entryOfProcess(p proc) (catEntry, string, bool) {
+	for _, e := range catalog {
+		target := p.exe
+		if e.inArgs {
+			target = p.cmd
+		}
+		if e.re == nil || !e.re.MatchString(target) {
+			continue
+		}
+		if e.unless != nil {
+			if ident := identityOf(p); ident != nil && ident.Org != nil && e.unless.MatchString(*ident.Org) {
+				continue
+			}
+		}
+		return e, "", true
+	}
+	return entryOfIdentity(identityOf(p))
+}
+
+type identifyClient struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	By    string `json:"by"`
+}
+
+func identifyAndExit() {
+	target := ""
+	for i, a := range os.Args {
+		if a == "--identify" && i+1 < len(os.Args) {
+			target = os.Args[i+1]
+		}
+	}
+	file := target
+	if strings.HasSuffix(target, ".app") {
+		file = filepath.Join(target, "Contents", "MacOS", plistKey(target, "CFBundleExecutable"))
+	}
+	ident := identityOfFile(file)
+	var hit *identifyClient
+	for _, e := range catalog {
+		if !e.inArgs && e.re != nil && e.re.MatchString(file) {
+			hit = &identifyClient{e.id, e.label, "its name"}
+			break
+		}
+	}
+	if hit == nil {
+		if e, by, ok := entryOfIdentity(ident); ok {
+			hit = &identifyClient{e.id, e.label, by}
+		}
+	}
+	out := struct {
+		Path     string          `json:"path"`
+		Identity *identity       `json:"identity"`
+		Client   *identifyClient `json:"client"`
+	}{file, ident, hit}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
+	fmt.Print(buf.String())
+	os.Exit(0)
 }

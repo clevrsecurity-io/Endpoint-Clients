@@ -43,14 +43,25 @@ on its own host without the machines reading as ungoverned.
 
 ## What it detects
 
-Claude Desktop, ChatGPT desktop, Cursor, Windsurf, Claude Code, Gemini CLI, GitHub
-Copilot CLI, Augment, Codex, Ollama and LM Studio, plus heuristic Python and Node
-agents. For each it reports:
+Claude Desktop, ChatGPT desktop, ChatGPT Atlas, Perplexity, Comet, Microsoft Copilot, Cursor, Windsurf, Kiro, Trae, Claude Code, Codex and its computer-use agent, Gemini CLI, GitHub Copilot CLI, Augment, Goose, OpenCode, Aider, AnythingLLM, and the local model runners Ollama, LM Studio, Jan, GPT4All and Msty, plus heuristic Python and Node agents. Raycast,
+Warp and Zed, which carry AI among other things, are listed as **AI APP** and never
+counted as shadow AI: whether their AI is used cannot be seen from the machine.
+
+An executable the names miss is read once more, from what the file carries and a
+rename keeps. On a Mac: the application it belongs to (the name and identifier in
+its Info.plist) and the organisation that signed it. On Windows: the product,
+original file name and company its version information declares. A renamed
+application is still what its bundle says it is, an application the list does not
+name is found by the name it declares, and a binary signed by OpenAI, Anthropic or
+Mistral AI under any name is reported as theirs. Linux reads names only. A maker's
+updater or crash reporter belongs to its product when the product is there.
+The Windows reading follows PowerShell's documented process and version information and is not verified on a live Windows machine, so it can only add a find, never remove one. `--identify <path>` shows that reading for one file or application. For each client it reports:
 
 - **GOVERNED**: something actually gates this client. A hook in its harness, the MCP guard wrapping its servers, or an LLM gateway base URL on our host.
 
   **The Clevr MCP server configured as a server is NOT this.** It exposes two tools, one to ask for a verdict and one to look a resource up. The client can ask; nothing obliges it to and nothing stops it when it does not. A machine with only the Clevr MCP server reads as shadow, with the Clevr MCP server named on its line, because calling it governed puts a green tag where Clevr gates nothing. What gates a client's own tools is the guard, which wraps the servers it already has.
-- **LOCAL**: a local model runner (Ollama / LM Studio); there is no cloud gateway to route through, so govern its tool use via a local MCP proxy.
+- **LOCAL**: a local model runner (Ollama, LM Studio, Jan, GPT4All, Msty); there is no cloud gateway to route through, so govern its tool use via a local MCP proxy.
+- **AI APP**: an application with AI built in (Raycast, Warp, Zed); listed, not counted as shadow AI.
 - **SHADOW**: running, with no evidence it is governed.
 
 The command-line harnesses are listed after the desktop applications on purpose,
@@ -156,8 +167,10 @@ version. Links are not followed, a folder with no `SKILL.md` is not a skill, the
 read stops at 200 files or 5 MB a skill (and says so), and nothing is written.
 
 Connections > Skills shows, for each skill, on how many machines it is installed
-and how many hold another version than the approved one, and lists apart the
-skills found on machines that no agent has loaded through Clevr.
+and how many hold another version than the approved one, grouped by the level a
+decision is taken at: personal and project skills one by one, plugins one row
+each, the tools' built-in skills folded. A skill no agent has loaded through
+Clevr is listed too, marked as such.
 
 ## Remediate (`--govern`)
 

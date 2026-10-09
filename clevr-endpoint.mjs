@@ -25,13 +25,13 @@
 // points the client at. This closes the visibility gap ("is there an ungoverned
 // agent on this laptop?") and then closes the gap itself, without becoming an EDR.
 
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const VERSION = '0.2.0'
+const VERSION = '0.3.0'
 const args = new Set(process.argv.slice(2))
 const CLEVR_URL = process.env.CLEVR_URL || ''
 const CLEVR_KEY = process.env.CLEVR_API_KEY || ''
@@ -65,10 +65,18 @@ const clevrHosts = () => new Set([CLEVR_HOST, hostOf(MCP_URL)].filter(Boolean))
 // interpreter.
 const CATALOG = [
   { id: 'claude-code', label: 'Claude Code (CLI)', kind: 'cli-agent', inArgs: true, re: /claude[-_ ]?code|@anthropic-ai[\/\\]claude-code/i },
-  { id: 'cursor', label: 'Cursor', kind: 'ide-agent', re: /(?:^|[\/\\ ])cursor(?:\.exe| helper|$|[\/\\ ])/i },
-  { id: 'windsurf', label: 'Windsurf', kind: 'ide-agent', re: /windsurf/i },
-  { id: 'chatgpt', label: 'ChatGPT desktop', kind: 'desktop-assistant', re: /chatgpt/i },
-  { id: 'claude-desktop', label: 'Claude Desktop', kind: 'desktop-assistant', re: /(?:^|[\/\\ ])claude(?:\.exe| helper|$|[\/\\ ])/i },
+  { id: 'cursor', label: 'Cursor', kind: 'ide-agent', re: /(?:^|[\/\\ ])cursor(?:\.exe| helper|$|[\/\\ ])/i, names: ['cursor'] },
+  { id: 'windsurf', label: 'Windsurf', kind: 'ide-agent', re: /windsurf/i, names: ['windsurf'] },
+  // The ChatGPT browser before the ChatGPT application, whose pattern is any
+  // path naming ChatGPT.
+  { id: 'chatgpt-atlas', label: 'ChatGPT Atlas (AI browser)', kind: 'ai-browser', re: /chatgpt[ ._-]?atlas/i, names: ['chatgpt atlas'] },
+  { id: 'chatgpt', label: 'ChatGPT desktop', kind: 'desktop-assistant', re: /chatgpt/i, names: ['chatgpt', 'chatgpt classic'] },
+  { id: 'claude-desktop', label: 'Claude Desktop', kind: 'desktop-assistant', re: /(?:^|[\/\\ ])claude(?:\.exe| helper|$|[\/\\ ])/i, names: ['claude'] },
+  { id: 'perplexity', label: 'Perplexity', kind: 'desktop-assistant', re: /(?:^|[\/\\ ])perplexity(?:\.exe| helper|$|[\/\\ ])/i, names: ['perplexity'] },
+  { id: 'comet', label: 'Comet (AI browser)', kind: 'ai-browser', re: /[\/\\]Comet\.app[\/\\]|(?:^|[\/\\])comet\.exe$/i, names: ['comet'] },
+  // Microsoft's assistant before the GitHub command line, which answers to the
+  // same word: the application is a bundle (Copilot.app) on a Mac.
+  { id: 'microsoft-copilot', label: 'Microsoft Copilot', kind: 'desktop-assistant', re: /[\/\\]Copilot\.app[\/\\]|(?:^|[\/\\])(?:microsoft[ .]?copilot|m365copilot)(?:\.exe)?$/i, names: ['microsoft copilot', 'copilot'] },
   // The command-line harnesses come AFTER the desktop applications on purpose.
   // ChatGPT desktop ships a binary literally named `codex` inside its own bundle
   // (Contents/Resources/codex), and a machine carrying one product must not be
@@ -84,16 +92,44 @@ const CATALOG = [
   // Codex CLI. Missing a harness that runs under an unexpected name costs us a
   // line in an inventory; inventing one puts a client on a security screen that
   // is not there, and the install-path check below still finds a real one.
+  // Codex's own agent that controls the desktop (installed under ~/.codex), a
+  // bundle whose service carries no product word in its name. Found on the
+  // founder's Mac on 2026-10-09 by its signature alone.
+  { id: 'codex-computer-use', label: 'Codex computer use (controls the desktop)', kind: 'cli-agent', re: /[\/\\]Codex Computer Use\.app[\/\\]/i, names: ['codex computer use'] },
   { id: 'gemini-cli', label: 'Gemini CLI', kind: 'cli-agent', re: /(?:^|[\/\\])gemini(?:\.exe)?$/i },
-  { id: 'copilot-cli', label: 'GitHub Copilot CLI', kind: 'cli-agent', re: /(?:^|[\/\\])copilot(?:\.exe)?$/i },
+  // A copilot.exe that Microsoft signed is its assistant, not this.
+  { id: 'copilot-cli', label: 'GitHub Copilot CLI', kind: 'cli-agent', re: /(?:^|[\/\\])copilot(?:\.exe)?$/i, unless: /\bMicrosoft\b/i },
   { id: 'augment', label: 'Augment', kind: 'cli-agent', re: /(?:^|[\/\\])(?:auggie|augment)(?:\.exe)?$/i },
   { id: 'codex', label: 'Codex (CLI)', kind: 'cli-agent', re: /(?:^|[\/\\])codex(?:\.exe)?$/i },
-  { id: 'ollama', label: 'Ollama (local model)', kind: 'local-model', re: /ollama/i },
-  { id: 'lmstudio', label: 'LM Studio (local model)', kind: 'local-model', re: /lm[-_ ]?studio/i },
+  { id: 'goose', label: 'Goose', kind: 'cli-agent', re: /(?:^|[\/\\])goose(?:\.exe)?$|[\/\\]Goose\.app[\/\\]/i, names: ['goose'] },
+  { id: 'opencode', label: 'OpenCode', kind: 'cli-agent', re: /(?:^|[\/\\])opencode(?:\.exe)?$/i, names: ['opencode'] },
+  { id: 'aider', label: 'Aider', kind: 'cli-agent', inArgs: true, re: /(?:^|[\/\\ ])aider(?:\.exe)?(?:\s|$)|\s-m\s+aider\b/i },
+  { id: 'kiro', label: 'Kiro', kind: 'ide-agent', re: /[\/\\]Kiro\.app[\/\\]|(?:^|[\/\\])kiro(?:\.exe)?$/i, names: ['kiro'] },
+  { id: 'trae', label: 'Trae', kind: 'ide-agent', re: /[\/\\]Trae\.app[\/\\]|(?:^|[\/\\])trae(?:\.exe)?$/i, names: ['trae'] },
+  { id: 'ollama', label: 'Ollama (local model)', kind: 'local-model', re: /ollama/i, names: ['ollama'] },
+  { id: 'lmstudio', label: 'LM Studio (local model)', kind: 'local-model', re: /lm[-_ ]?studio/i, names: ['lm studio'] },
+  { id: 'jan', label: 'Jan (local model)', kind: 'local-model', re: /[\/\\]Jan\.app[\/\\]|(?:^|[\/\\])jan(?:\.exe)?$/i, names: ['jan'] },
+  { id: 'gpt4all', label: 'GPT4All (local model)', kind: 'local-model', re: /gpt4all/i, names: ['gpt4all'] },
+  { id: 'msty', label: 'Msty (local model)', kind: 'local-model', re: /[\/\\]Msty\.app[\/\\]|(?:^|[\/\\])msty(?:\.exe)?$/i, names: ['msty'] },
+  { id: 'anythingllm', label: 'AnythingLLM', kind: 'desktop-assistant', re: /anythingllm/i, names: ['anythingllm'] },
+  // Applications that carry AI among other things. Listed, so an inventory is
+  // complete, and never counted as shadow AI: whether their AI is used cannot
+  // be seen from the machine.
+  { id: 'raycast', label: 'Raycast (AI built in)', kind: 'ai-feature', re: /[\/\\]Raycast\.app[\/\\]|(?:^|[\/\\])raycast(?:\.exe)?$/i, names: ['raycast'] },
+  { id: 'warp', label: 'Warp (AI built in)', kind: 'ai-feature', re: /[\/\\]Warp\.app[\/\\]|(?:^|[\/\\])warp(?:\.exe)?$/i, names: ['warp'] },
+  { id: 'zed', label: 'Zed (AI built in)', kind: 'ai-feature', re: /[\/\\]Zed\.app[\/\\]|(?:^|[\/\\])zed(?:\.exe)?$/i, names: ['zed'] },
   // Heuristic homegrown agents: match on specific agent FRAMEWORKS only (not the
   // bare words "agent"/"mcp", which catch unrelated tooling and cause false positives).
   { id: 'py-agent', label: 'Python agent', kind: 'custom-agent', inArgs: true, re: /python[0-9.]*\b.*(langchain|langgraph|crewai|autogen|llama[_-]?index|pydantic_ai|smolagents|@?modelcontextprotocol[\/\\]server)/i },
-  { id: 'node-agent', label: 'Node agent', kind: 'custom-agent', inArgs: true, re: /\bnode\b.*(langchain|@langchain|crewai|@modelcontextprotocol[\/\\]server|ai-sdk|@openai[\/\\]agents)/i }
+  { id: 'node-agent', label: 'Node agent', kind: 'custom-agent', inArgs: true, re: /\bnode\b.*(langchain|@langchain|crewai|@modelcontextprotocol[\/\\]server|ai-sdk|@openai[\/\\]agents)/i },
+  // Only reached through an executable's signature or declared company
+  // (identityOf below): an application by a maker whose every product is AI.
+  // family: the maker's products. Its updater or crash reporter, signed by the
+  // same maker, belongs to the product when the product is there, and stands
+  // on its own only when none is: a renamed binary, or a product not listed.
+  { id: 'openai-app', label: 'An application signed by OpenAI', kind: 'desktop-assistant', re: null, family: ['chatgpt', 'chatgpt-atlas', 'codex', 'codex-computer-use'] },
+  { id: 'anthropic-app', label: 'An application signed by Anthropic', kind: 'desktop-assistant', re: null, family: ['claude-desktop', 'claude-code'] },
+  { id: 'mistral-app', label: 'An application signed by Mistral AI', kind: 'desktop-assistant', re: null, family: [] }
 ]
 
 // Where each client keeps its MCP configuration, keyed by the SAME ids as CATALOG
@@ -160,7 +196,27 @@ function installPaths (home, appData) {
     augment: [path.join(home, '.augment')],
     codex: [path.join(home, '.codex')],
     ollama: [...apps('Ollama'), path.join(home, '.ollama')],
-    lmstudio: [...apps('LM Studio'), path.join(home, '.lmstudio'), ...sup('LM Studio')]
+    lmstudio: [...apps('LM Studio'), path.join(home, '.lmstudio'), ...sup('LM Studio')],
+    // The applications added on 2026-10-09, by their bundle on a Mac and the
+    // documented per-user layout elsewhere. The data folders of the command
+    // lines below are their own documented homes.
+    'chatgpt-atlas': apps('ChatGPT Atlas'),
+    perplexity: [...apps('Perplexity'), ...sup('Perplexity')],
+    comet: apps('Comet'),
+    'microsoft-copilot': apps('Copilot'),
+    'codex-computer-use': [path.join(home, '.codex', 'computer-use', 'Codex Computer Use.app')],
+    goose: [...apps('Goose'), path.join(home, '.config', 'goose')],
+    opencode: [path.join(home, '.config', 'opencode')],
+    aider: [path.join(home, '.aider.conf.yml')],
+    kiro: [...apps('Kiro'), path.join(home, '.kiro')],
+    trae: [...apps('Trae'), ...sup('Trae')],
+    jan: [...apps('Jan'), ...sup('Jan')],
+    gpt4all: [...apps('GPT4All'), ...sup('nomic.ai', 'GPT4All')],
+    msty: [...apps('Msty'), ...sup('Msty')],
+    anythingllm: [...apps('AnythingLLM'), ...sup('anythingllm-desktop')],
+    raycast: apps('Raycast'),
+    warp: apps('Warp'),
+    zed: apps('Zed')
   }
 }
 
@@ -171,6 +227,132 @@ function installedClients (home, appData) {
     if (hit) found[id] = hit
   }
   return found
+}
+
+// ── Who an executable is, beyond its name ────────────────────────────────────
+// A process is first recognised by its executable's name (CATALOG). A renamed
+// binary, or an application by a maker the names do not list, passed unseen
+// (founder, 2026-10-09: "tout ce qui n'est pas dans la liste passe"). So an
+// executable the names miss is read once more, from what the file carries and a
+// rename keeps:
+//   macOS    the application it belongs to (its bundle's name and identifier,
+//            from Info.plist) and the organisation that signed it (codesign)
+//   Windows  the product, original file name and company its version
+//            information declares (one PowerShell call for every process)
+//   Linux    nothing more: an executable is known by its name only
+// Read, never written. System locations are skipped, and each executable is
+// read once per scan.
+// A function, not a pattern with a lookahead, so the Go agent reads it the same way.
+const SYSTEM_PREFIXES = ['/System/', '/sbin/', '/bin/', '/Library/Apple/', '/private/var/db/', '/Library/Developer/CommandLineTools/']
+const isSystemExe = (f) => SYSTEM_PREFIXES.some(x => f.startsWith(x)) || (f.startsWith('/usr/') && !f.startsWith('/usr/local/')) || /^[A-Za-z]:\\Windows\\/i.test(f)
+// Makers whose signature alone says what an executable is.
+const SIGNERS = [
+  { re: /\bAnysphere\b/i, id: 'cursor' },
+  { re: /\b(?:Exafunction|Codeium)\b/i, id: 'windsurf' },
+  { re: /\bPerplexity\b/i, id: 'perplexity' },
+  { re: /\bOllama\b/i, id: 'ollama' },
+  { re: /\bElement Labs\b/i, id: 'lmstudio' },
+  { re: /\bOpenAI\b/i, id: 'openai-app' },
+  { re: /\bAnthropic\b/i, id: 'anthropic-app' },
+  { re: /\bMistral AI\b/i, id: 'mistral-app' }
+]
+// Both streams: codesign says what it found on stderr, and succeeds.
+const runQuiet = (cmd, argv, timeout = 5000) => {
+  const r = spawnSync(cmd, argv, { encoding: 'utf8', timeout, maxBuffer: 16 << 20 })
+  return String(r.stdout || '') + String(r.stderr || '')
+}
+
+// The bundle an executable belongs to: the innermost .app holding it.
+function bundleOf (exe) {
+  const i = exe.lastIndexOf('.app/')
+  return i > 0 ? exe.slice(0, i + 4) : null
+}
+function plistKey (bundle, key) {
+  const v = runQuiet('/usr/bin/plutil', ['-extract', key, 'raw', '-o', '-', path.join(bundle, 'Contents', 'Info.plist')]).trim()
+  return v && !/^(?:<stdin>|Error|.*: )/.test(v) && !v.includes('No value at that key path') ? v : null
+}
+// The organisation in a code signature's leaf certificate, without the
+// certificate kind and the team: "Developer ID Application: OpenAI OpCo, LLC
+// (2DC432GLL2)" reads "OpenAI OpCo, LLC".
+function signerOf (file) {
+  const m = /^Authority=(.+)$/m.exec(runQuiet('/usr/bin/codesign', ['-dv', '--verbose=2', file]))
+  if (!m) return null
+  return m[1].replace(/^(?:Developer ID Application|Apple Development|Apple Distribution|Mac App Distribution|3rd Party Mac Developer Application): /, '').replace(/ \([A-Z0-9]{10}\)$/, '').trim() || null
+}
+let winIdentity = null
+// Windows: every process's product, original file name and company, at once.
+function windowsIdentities () {
+  if (winIdentity) return winIdentity
+  winIdentity = new Map()
+  const ps = 'Get-Process | Where-Object { $_.Path } | ForEach-Object { $v = $_.MainModule.FileVersionInfo; [pscustomobject]@{ pid = [string]$_.Id; path = $_.Path; company = $v.CompanyName; product = $v.ProductName; original = $v.OriginalFilename; description = $v.FileDescription } } | ConvertTo-Json -Compress'
+  try {
+    const list = JSON.parse(runQuiet('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], 20000) || '[]')
+    for (const x of Array.isArray(list) ? list : [list]) if (x && x.pid) winIdentity.set(String(x.pid), x)
+  } catch { /* PowerShell absent or refused: names only */ }
+  return winIdentity
+}
+const identityCache = new Map()
+// What the file says it is: { name, org, bundle } or null. name is a product
+// or application name, org the signer or declared company.
+function identityOf (p) {
+  if (process.platform === 'win32') {
+    const w = windowsIdentities().get(String(p.pid))
+    if (!w || isSystemExe(w.path || '')) return null
+    const name = [w.product, w.original, w.description].map(v => String(v || '').replace(/\.exe$/i, '').trim()).find(Boolean) || null
+    const names = [...new Set([w.product, w.original, w.description].map(v => String(v || '').replace(/\.exe$/i, '').trim()).filter(Boolean))]
+    return name || w.company ? { name, names, org: w.company || null, bundle: null, signed: false } : null
+  }
+  if (process.platform !== 'darwin') return null
+  const exe = p.exe
+  if (!exe || !exe.startsWith('/') || isSystemExe(exe)) return null
+  if (identityCache.has(exe)) return identityCache.get(exe)
+  const bundle = bundleOf(exe)
+  const names = bundle ? [...new Set([plistKey(bundle, 'CFBundleDisplayName'), plistKey(bundle, 'CFBundleName')].filter(Boolean))] : []
+  const id = bundle ? plistKey(bundle, 'CFBundleIdentifier') : null
+  const org = signerOf(exe)
+  const out = (names.length || org) ? { name: names[0] || null, names, org, bundle: id, signed: !!org } : null
+  identityCache.set(exe, out)
+  return out
+}
+// What one file says it is, without a running process (--identify).
+function identityOfFile (file) {
+  if (process.platform === 'win32') {
+    const ps = `$v = (Get-Item -LiteralPath '${String(file).replace(/'/g, "''")}').VersionInfo; [pscustomobject]@{ company = $v.CompanyName; product = $v.ProductName; original = $v.OriginalFilename; description = $v.FileDescription } | ConvertTo-Json -Compress`
+    try {
+      const w = JSON.parse(runQuiet('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], 20000) || 'null')
+      if (!w) return null
+      const names = [...new Set([w.product, w.original, w.description].map(v => String(v || '').replace(/\.exe$/i, '').trim()).filter(Boolean))]
+      return names.length || w.company ? { name: names[0] || null, names, org: w.company || null, bundle: null, signed: false } : null
+    } catch { return null }
+  }
+  return identityOf({ pid: null, exe: file })
+}
+
+// The catalog entry an identity names: by an application name first, then by a
+// maker whose every product is AI.
+function entryOfIdentity (ident) {
+  if (!ident) return null
+  const wanted = ident.names.map(n => n.toLowerCase())
+  const byName = CATALOG.find(e => (e.names || []).some(n => wanted.includes(n)))
+  if (byName) return { entry: byName, by: `its application name (${ident.names.find(n => (byName.names || []).includes(n.toLowerCase()))})` }
+  const signer = ident.org && SIGNERS.find(s => s.re.test(ident.org))
+  // A Mac reads the organisation that signed the file; Windows, the company the
+  // file declares, which is weaker and said so.
+  if (signer) return { entry: CATALOG.find(e => e.id === signer.id), by: `${ident.signed ? 'its signature' : 'its declared maker'} (${ident.org})` }
+  return null
+}
+// The entry a process is: its name, unless the file says otherwise, then what
+// the file says. Returns { entry, by } (by is null for a match on the name).
+function entryOfProcess (p) {
+  for (const entry of CATALOG) {
+    if (!entry.re || !entry.re.test(entry.inArgs ? p.cmd : p.exe)) continue
+    if (entry.unless) {
+      const ident = identityOf(p)
+      if (ident && ident.org && entry.unless.test(ident.org)) continue
+    }
+    return { entry, by: null }
+  }
+  return entryOfIdentity(identityOf(p))
 }
 
 function listProcesses () {
@@ -746,6 +928,10 @@ function assess (entry, sig) {
     ev.push('Local model runner: no cloud gateway to route through; govern its tool use via a local MCP proxy')
     return { monitored: false, via: 'local', evidence: ev }
   }
+  if (entry.kind === 'ai-feature') {
+    ev.push('An application with AI built in: whether its AI is used cannot be seen from the machine, so it is listed, not counted as shadow AI')
+    return { monitored: false, via: 'feature', evidence: ev }
+  }
   // Stated after the verdict lines and never counted into them: a gate nobody
   // calls governs nothing.
   const gate = sig.wrapperGate?.[entry.id]
@@ -769,18 +955,28 @@ function buildReport () {
   // processes — count them, don't list the app ten times). First matching
   // process is the representative; `procs` is how many matched.
   const byId = new Map()
+  const named = new Set(), seenBy = new Map()
   for (const p of procs) {
-    for (const entry of CATALOG) {
-      if (entry.re.test(entry.inArgs ? p.cmd : p.exe)) {
-        let c = byId.get(entry.id)
-        if (!c) {
-          c = { id: entry.id, label: entry.label, kind: entry.kind, pid: p.pid, procs: 0, ...assess(entry, sig) }
-          byId.set(entry.id, c)
-        }
-        c.procs += 1
-        break
-      }
+    const hit = entryOfProcess(p)
+    if (!hit) continue
+    const { entry, by } = hit
+    let c = byId.get(entry.id)
+    if (!c) {
+      c = { id: entry.id, label: entry.label, kind: entry.kind, pid: p.pid, procs: 0, ...assess(entry, sig) }
+      byId.set(entry.id, c)
     }
+    c.procs += 1
+    if (!by) named.add(entry.id)
+    else if (!seenBy.has(entry.id)) seenBy.set(entry.id, `Recognised by ${by}, running as ${path.basename(p.exe || p.cmd || '?')}`)
+  }
+  // A client none of whose processes answered to its name (a renamed
+  // executable, or one the names do not list) says how it was recognised. One
+  // that did, whose helper was found by its bundle, needs no such line.
+  for (const [id, line] of seenBy) if (!named.has(id)) byId.get(id).evidence.unshift(line)
+  for (const e of CATALOG) {
+    const maker = e.family && byId.get(e.id)
+    const product = maker && e.family.map(id => byId.get(id)).find(Boolean)
+    if (product) { product.procs += maker.procs; byId.delete(e.id) }
   }
   // A client that is installed but closed still belongs in the inventory. It is
   // added after the running ones so the list keeps ps order at the top.
@@ -808,8 +1004,10 @@ function buildReport () {
     // Kept to its original meaning, running and ungoverned, so the number does
     // not silently change under anyone reading it. What is installed but closed
     // and ungoverned is counted beside it rather than folded in.
-    shadow: live.filter(c => !c.monitored).length,
-    shadow_installed: clients.filter(c => !c.running && !c.monitored).length,
+    // A local model and an application with AI built in are listed and never
+    // counted as shadow AI, as the Go agent always did for local models.
+    shadow: live.filter(c => !c.monitored && c.via !== 'local' && c.via !== 'feature').length,
+    shadow_installed: clients.filter(c => !c.running && !c.monitored && c.via !== 'local' && c.via !== 'feature').length,
     // Counted apart because it is the strongest thing this machine can say: a
     // hook in the harness checks every tool call before it runs, and no config
     // rewrite quietly removes it.
@@ -927,7 +1125,7 @@ function printReport (report) {
   console.log(`Clevr gateway: ${CLEVR_HOST || '(not configured)'}\n${'-'.repeat(70)}`)
   if (!clients.length) console.log('No known AI clients detected running.')
   for (const c of clients) {
-    const tag = c.monitored ? 'GOVERNED' : (c.kind === 'local-model' ? 'LOCAL   ' : 'SHADOW  ')
+    const tag = c.monitored ? 'GOVERNED' : c.kind === 'local-model' ? 'LOCAL   ' : c.kind === 'ai-feature' ? 'AI APP  ' : 'SHADOW  '
     const depth = c.via === 'hook' ? ' via hook' : c.via === 'mcp' ? ' via MCP' : c.via === 'llm-gateway' ? ' via gateway' : ''
     const where = c.running ? `pid ${c.pid}` : 'installed, not running'
     console.log(`[${tag}] ${c.label}  (${where}, ${c.kind})${c.monitored ? depth : ''}`)
@@ -1676,6 +1874,19 @@ async function runOnce () {
   if (plan && !args.has('--json')) printPlan(plan, args.has('--apply'))
   if (!args.has('--json')) printDrift(report.drift)
   if (args.has('--report')) await postReport(report)
+}
+
+// --identify <path>: how this agent recognises one executable or application,
+// and nothing else. For support ("why is this not listed?") and for the tests,
+// which cannot start a renamed client on every machine they run on.
+if (args.has('--identify')) {
+  const target = process.argv[process.argv.indexOf('--identify') + 1] || ''
+  const file = target.endsWith('.app') ? path.join(target, 'Contents', 'MacOS', plistKey(target, 'CFBundleExecutable') || '') : target
+  const byName = CATALOG.find(e => !e.inArgs && e.re && e.re.test(file))
+  const ident = identityOfFile(file)
+  const hit = byName ? { entry: byName, by: 'its name' } : entryOfIdentity(ident)
+  console.log(JSON.stringify({ path: file, identity: ident, client: hit ? { id: hit.entry.id, label: hit.entry.label, by: hit.by } : null }, null, 2))
+  process.exit(0)
 }
 
 await runOnce()
