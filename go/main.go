@@ -18,7 +18,9 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,9 +36,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 var (
 	clevrURL   = os.Getenv("CLEVR_URL")
@@ -744,6 +747,7 @@ type machine struct {
 	WrapperGate    map[string]string `json:"wrapperGate"`
 	McpJson        []mcpJsonEntry    `json:"mcpJson"`
 	Extensions     []browserExt      `json:"extensions"`
+	Skills         []skillOnMachine  `json:"skills"`
 }
 
 // A server declared in a .mcp.json. Surface, never a governance verdict: an
@@ -1274,6 +1278,7 @@ func machineSignals() machine {
 		WrapperGate:    gates,
 		McpJson:        mcpJsonServers(home),
 		Extensions:     browserExtensions(home, appData),
+		Skills:         skillsOnMachine(home),
 		MCP: mcpSignals{
 			"claude-desktop": firstGoverned(claudeCfg),
 			"cursor":         firstGoverned(cursorCfg),
@@ -1881,6 +1886,7 @@ func printReport(r report) {
 	}
 	printMcpJson(r.Machine.McpJson)
 	printExtensions(printExtensionsAfter)
+	printSkills(r.Machine.Skills)
 	fmt.Println()
 }
 
@@ -2022,4 +2028,336 @@ func main() {
 			runOnce()
 		}
 	}
+}
+
+// ── Skills on this machine ───────────────────────────────────────────────────
+// The same reading as the Node agent's skillsOnMachine, byte for byte: the
+// folders each tool documents, never a crawl, and each skill with the version
+// of its files as the plugins compute it (sha256 over "path\0sha256\n" of every
+// file, in byte order). Read, never written.
+
+type skillOnMachine struct {
+	Name        string   `json:"name"`
+	Scope       string   `json:"scope"`
+	Tools       []string `json:"tools"`
+	Project     *string  `json:"project"`
+	Path        string   `json:"path"`
+	Fingerprint *string  `json:"fingerprint"`
+	Files       int      `json:"files"`
+	Partial     bool     `json:"partial"`
+	Description *string  `json:"description"`
+	Clevr       bool     `json:"clevr"`
+}
+
+type skillRoot struct {
+	dir     string
+	scope   string
+	tools   []string
+	plugin  string
+	project string
+}
+
+var skillSkip = map[string]bool{".git": true, "node_modules": true, ".DS_Store": true, ".clevr-skill.json": true}
+
+const skillMaxFiles = 200
+const skillMaxBytes = 5 * 1024 * 1024
+const skillsMax = 300
+
+// Folders inside dir, not hidden, not links, in byte order.
+func skillSubdirs(dir string) []string {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range ents {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func skillRootsOnMachine(home string) []skillRoot {
+	roots := []skillRoot{
+		{dir: filepath.Join(home, ".claude", "skills"), scope: "personal", tools: []string{"Claude Code", "Cursor"}},
+		{dir: filepath.Join(home, ".agents", "skills"), scope: "personal", tools: []string{"Codex", "Cursor", "Copilot", "Gemini CLI"}},
+		{dir: filepath.Join(home, ".codex", "skills"), scope: "personal", tools: []string{"Codex", "Cursor"}},
+		{dir: filepath.Join(home, ".codex", "skills", ".system"), scope: "built-in", tools: []string{"Codex"}},
+		{dir: filepath.Join(home, ".cursor", "skills"), scope: "personal", tools: []string{"Cursor"}},
+		{dir: filepath.Join(home, ".gemini", "skills"), scope: "personal", tools: []string{"Gemini CLI"}},
+		{dir: filepath.Join(home, ".copilot", "skills"), scope: "personal", tools: []string{"Copilot"}},
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		roots = append(roots, skillRoot{dir: "/Library/Application Support/ClaudeCode/.claude/skills", scope: "administrator", tools: []string{"Claude Code"}})
+	case "windows":
+		roots = append(roots, skillRoot{dir: `C:\Program Files\ClaudeCode\.claude\skills`, scope: "administrator", tools: []string{"Claude Code"}})
+	default:
+		roots = append(roots, skillRoot{dir: "/etc/claude-code/.claude/skills", scope: "administrator", tools: []string{"Claude Code"}})
+	}
+	if runtime.GOOS != "windows" {
+		roots = append(roots, skillRoot{dir: "/etc/codex/skills", scope: "administrator", tools: []string{"Codex"}})
+	}
+	// Plugins: Claude Code's registry, the newest copy of each plugin in Codex's
+	// cache, Gemini CLI's extensions.
+	var reg struct {
+		Plugins map[string]json.RawMessage `json:"plugins"`
+	}
+	if b, err := os.ReadFile(filepath.Join(home, ".claude", "plugins", "installed_plugins.json")); err == nil {
+		_ = json.Unmarshal(b, &reg)
+	}
+	keys := make([]string, 0, len(reg.Plugins))
+	for k := range reg.Plugins {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	type installEntry struct {
+		InstallPath string `json:"installPath"`
+	}
+	for _, k := range keys {
+		var list []installEntry
+		if err := json.Unmarshal(reg.Plugins[k], &list); err != nil {
+			var one installEntry
+			if json.Unmarshal(reg.Plugins[k], &one) == nil {
+				list = []installEntry{one}
+			}
+		}
+		for _, e := range list {
+			if e.InstallPath != "" {
+				roots = append(roots, skillRoot{dir: filepath.Join(e.InstallPath, "skills"), scope: "plugin", tools: []string{"Claude Code"}, plugin: strings.SplitN(k, "@", 2)[0]})
+			}
+		}
+	}
+	codexCache := filepath.Join(home, ".codex", "plugins", "cache")
+	for _, market := range skillSubdirs(codexCache) {
+		for _, plugin := range skillSubdirs(filepath.Join(codexCache, market)) {
+			versions := skillSubdirs(filepath.Join(codexCache, market, plugin))
+			if len(versions) > 0 {
+				roots = append(roots, skillRoot{dir: filepath.Join(codexCache, market, plugin, versions[len(versions)-1], "skills"), scope: "plugin", tools: []string{"Codex"}, plugin: plugin})
+			}
+		}
+	}
+	gemExt := filepath.Join(home, ".gemini", "extensions")
+	for _, ext := range skillSubdirs(gemExt) {
+		roots = append(roots, skillRoot{dir: filepath.Join(gemExt, ext, "skills"), scope: "plugin", tools: []string{"Gemini CLI"}, plugin: ext})
+	}
+	// The projects Claude Code knows, bounded.
+	var cj struct {
+		Projects map[string]json.RawMessage `json:"projects"`
+	}
+	if b, err := os.ReadFile(filepath.Join(home, ".claude.json")); err == nil {
+		_ = json.Unmarshal(b, &cj)
+	}
+	projects := make([]string, 0, len(cj.Projects))
+	for p := range cj.Projects {
+		if p != "" {
+			projects = append(projects, p)
+		}
+	}
+	sort.Strings(projects)
+	if len(projects) > 100 {
+		projects = projects[:100]
+	}
+	subs := []struct {
+		sub   string
+		tools []string
+	}{
+		{filepath.Join(".claude", "skills"), []string{"Claude Code", "Cursor", "Copilot"}},
+		{filepath.Join(".agents", "skills"), []string{"Codex", "Cursor", "Copilot", "Gemini CLI"}},
+		{filepath.Join(".cursor", "skills"), []string{"Cursor"}},
+		{filepath.Join(".github", "skills"), []string{"Copilot"}},
+		{filepath.Join(".gemini", "skills"), []string{"Gemini CLI"}},
+	}
+	for _, root := range projects {
+		for _, sb := range subs {
+			dir := filepath.Join(root, sb.sub)
+			dup := false
+			for _, r := range roots {
+				if r.dir == dir {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				roots = append(roots, skillRoot{dir: dir, scope: "project", tools: sb.tools, project: root})
+			}
+		}
+	}
+	return roots
+}
+
+// The first n UTF-16 code units of s, as JavaScript's slice counts them.
+func jsSlice(s string, n int) string {
+	u := utf16.Encode([]rune(s))
+	if len(u) <= n {
+		return s
+	}
+	return string(utf16.Decode(u[:n]))
+}
+
+func skillDescription(text string) *string {
+	lines := strings.Split(jsSlice(text, 64*1024), "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSuffix(lines[i], "\r")
+	}
+	if len(lines) == 0 || lines[0] != "---" {
+		return nil
+	}
+	for i := 1; i < len(lines) && lines[i] != "---"; i++ {
+		if !strings.HasPrefix(lines[i], "description:") {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(lines[i], "description:"))
+		if strings.HasPrefix(v, "\"") || strings.HasPrefix(v, "'") {
+			v = v[1:]
+		}
+		if strings.HasSuffix(v, "\"") || strings.HasSuffix(v, "'") {
+			v = v[:len(v)-1]
+		}
+		if v == "" {
+			return nil
+		}
+		v = jsSlice(v, 300)
+		return &v
+	}
+	return nil
+}
+
+type skillFile struct{ path, sha string }
+
+func skillVersionOf(dir string) (fp *string, files int, partial bool, desc *string) {
+	var list []skillFile
+	bytesSeen := 0
+	var walk func(d string) error
+	walk = func(d string) error {
+		ents, err := os.ReadDir(d)
+		if err != nil {
+			return err
+		}
+		for _, e := range ents {
+			if skillSkip[e.Name()] {
+				continue
+			}
+			abs := filepath.Join(d, e.Name())
+			st, err := os.Lstat(abs)
+			if err != nil {
+				return err
+			}
+			if st.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if st.IsDir() {
+				if err := walk(abs); err != nil {
+					return err
+				}
+				continue
+			}
+			if !st.Mode().IsRegular() {
+				continue
+			}
+			if len(list) >= skillMaxFiles {
+				partial = true
+				continue
+			}
+			b, err := os.ReadFile(abs)
+			if err != nil {
+				return err
+			}
+			if bytesSeen+len(b) > skillMaxBytes {
+				partial = true
+				continue
+			}
+			bytesSeen += len(b)
+			rel, _ := filepath.Rel(dir, abs)
+			sum := sha256.Sum256(b)
+			list = append(list, skillFile{filepath.ToSlash(rel), hex.EncodeToString(sum[:])})
+		}
+		return nil
+	}
+	if err := walk(dir); err != nil {
+		return nil, len(list), true, nil
+	}
+	main, err := os.ReadFile(filepath.Join(dir, "SKILL.md"))
+	if err != nil {
+		return nil, len(list), true, nil
+	}
+	desc = skillDescription(string(main))
+	sort.Slice(list, func(i, j int) bool { return list[i].path < list[j].path })
+	var sb strings.Builder
+	for _, f := range list {
+		sb.WriteString(f.path + "\x00" + f.sha + "\n")
+	}
+	sum := sha256.Sum256([]byte(sb.String()))
+	h := hex.EncodeToString(sum[:])
+	return &h, len(list), partial, desc
+}
+
+func skillsOnMachine(home string) []skillOnMachine {
+	out := []skillOnMachine{}
+	seen := map[string]bool{}
+	for _, r := range skillRootsOnMachine(home) {
+		for _, n := range skillSubdirs(r.dir) {
+			dir := filepath.Join(r.dir, n)
+			if seen[dir] {
+				continue
+			}
+			st, err := os.Lstat(dir)
+			if err != nil || st.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(dir, "SKILL.md")); err != nil {
+				continue
+			}
+			seen[dir] = true
+			name := n
+			if r.plugin != "" {
+				name = r.plugin + ":" + n
+			}
+			var project *string
+			if r.project != "" {
+				p := r.project
+				project = &p
+			}
+			fp, files, partial, desc := skillVersionOf(dir)
+			_, clevrErr := os.Stat(filepath.Join(dir, ".clevr-skill.json"))
+			out = append(out, skillOnMachine{Name: name, Scope: r.scope, Tools: r.tools, Project: project, Path: dir, Fingerprint: fp, Files: files, Partial: partial, Description: desc, Clevr: clevrErr == nil})
+			if len(out) >= skillsMax {
+				return out
+			}
+		}
+	}
+	return out
+}
+
+func printSkills(skills []skillOnMachine) {
+	if len(skills) == 0 {
+		return
+	}
+	fmt.Println(strings.Repeat("-", 70))
+	fmt.Println("Skills on this machine")
+	for i, sk := range skills {
+		if i == 40 {
+			break
+		}
+		where := sk.Scope
+		if sk.Scope == "project" && sk.Project != nil {
+			where = "project " + *sk.Project
+		}
+		tag := "SKILL   "
+		if sk.Clevr {
+			tag = "CLEVR   "
+		}
+		ver := "unreadable"
+		if sk.Fingerprint != nil {
+			ver = (*sk.Fingerprint)[:12]
+		}
+		fmt.Printf("[%s] %s  (%s; %s)  %s\n", tag, sk.Name, where, strings.Join(sk.Tools, ", "), ver)
+	}
+	if len(skills) > 40 {
+		fmt.Printf("and %d more\n", len(skills)-40)
+	}
+	fmt.Println("Read, never written. Each skill is listed with the version of its files; whether that")
+	fmt.Println("version is approved, and which agents may load it, is answered in Clevr.")
 }

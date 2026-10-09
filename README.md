@@ -130,6 +130,35 @@ cannot turn itself green by corrupting its own file.
 
 Reports land at `POST /v1/endpoints` and roll up into a fleet shadow-AI view.
 
+## Skills
+
+A skill is a folder of instructions (a `SKILL.md` and the files beside it) that a
+coding tool loads to do a task its way. The Clevr plugins see a load when an agent
+makes one, but some tools inject skills with no call a hook can see, and a skill
+can sit on a machine for weeks before its first load. So the agent also lists the
+skills installed, from the folders each tool documents and nothing else:
+
+| Folder | Read by |
+|---|---|
+| `~/.claude/skills` | Claude Code, Cursor |
+| `~/.agents/skills` | Codex, Cursor, Copilot, Gemini CLI |
+| `~/.codex/skills` (and `.system`, its built-in ones) | Codex, Cursor |
+| `~/.cursor/skills`, `~/.gemini/skills`, `~/.copilot/skills` | Cursor, Gemini CLI, Copilot |
+| the administrator folders (`/Library/Application Support/ClaudeCode/.claude/skills`, `/etc/codex/skills`) | Claude Code, Codex |
+| each installed plugin's `skills` folder (Claude Code, Codex, Gemini CLI extensions) | that tool |
+| `.claude/skills`, `.agents/skills`, `.cursor/skills`, `.github/skills`, `.gemini/skills` in the projects Claude Code knows | the tools that read each |
+
+Each skill is listed with the version of its files: a sha256 over every file's path
+and hash, the fingerprint the Clevr plugins compute, so Clevr compares a machine's
+copy with the version an administrator approved before anyone loads it. A skill
+Clevr distributed carries a marker file, which is reported and left out of the
+version. Links are not followed, a folder with no `SKILL.md` is not a skill, the
+read stops at 200 files or 5 MB a skill (and says so), and nothing is written.
+
+Connections > Skills shows, for each skill, on how many machines it is installed
+and how many hold another version than the approved one, and lists apart the
+skills found on machines that no agent has loaded through Clevr.
+
 ## Remediate (`--govern`)
 
 For each client it can reach, `--govern` prints what it would change. Nothing is

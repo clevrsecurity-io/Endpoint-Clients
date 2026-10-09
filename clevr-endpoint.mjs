@@ -31,7 +31,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 const args = new Set(process.argv.slice(2))
 const CLEVR_URL = process.env.CLEVR_URL || ''
 const CLEVR_KEY = process.env.CLEVR_API_KEY || ''
@@ -490,6 +490,166 @@ function mcpJsonServers (home) {
   return found
 }
 
+// ── Skills on this machine ──────────────────────────────────────────────────
+// A skill is a folder holding a SKILL.md: instructions an agent loads to do a
+// task its way. The plugins report the skills an agent LOADS; this lists the
+// ones INSTALLED, read from the folders each tool reads, so a skill shows up
+// before anyone uses it, and on a tool whose loads no hook sees (Copilot hands a
+// skill to the model without a tool call). Read, never written. Each one comes
+// with the version of its files, the fingerprint the plugins compute (sha256
+// over "path\0sha256\n" of every file, in byte order), so the console can say
+// which machines hold a version nobody approved.
+//
+// The roots are the folders each tool documents: a person's own, the
+// administrator's, those of the plugins Claude Code and Codex installed and of
+// Gemini CLI's extensions, and the projects ~/.claude.json already knows. Never
+// a crawl, for the reason the .mcp.json reading gives above.
+const SKILL_SKIP = new Set(['.git', 'node_modules', '.DS_Store', '.clevr-skill.json'])
+const SKILL_MAX_FILES = 200
+const SKILL_MAX_BYTES = 5 * 1024 * 1024
+const SKILLS_MAX = 300
+const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex')
+
+function subdirs (dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true }).filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => e.name).sort(byteOrder)
+  } catch { return [] }
+}
+
+function skillRootsOnMachine (home) {
+  const roots = [
+    { dir: path.join(home, '.claude', 'skills'), scope: 'personal', tools: ['Claude Code', 'Cursor'] },
+    { dir: path.join(home, '.agents', 'skills'), scope: 'personal', tools: ['Codex', 'Cursor', 'Copilot', 'Gemini CLI'] },
+    { dir: path.join(home, '.codex', 'skills'), scope: 'personal', tools: ['Codex', 'Cursor'] },
+    { dir: path.join(home, '.codex', 'skills', '.system'), scope: 'built-in', tools: ['Codex'] },
+    { dir: path.join(home, '.cursor', 'skills'), scope: 'personal', tools: ['Cursor'] },
+    { dir: path.join(home, '.gemini', 'skills'), scope: 'personal', tools: ['Gemini CLI'] },
+    { dir: path.join(home, '.copilot', 'skills'), scope: 'personal', tools: ['Copilot'] },
+  ]
+  // The administrator's folders, which outrank a person's own.
+  if (process.platform === 'darwin') roots.push({ dir: '/Library/Application Support/ClaudeCode/.claude/skills', scope: 'administrator', tools: ['Claude Code'] })
+  else if (process.platform === 'win32') roots.push({ dir: 'C:\\Program Files\\ClaudeCode\\.claude\\skills', scope: 'administrator', tools: ['Claude Code'] })
+  else roots.push({ dir: '/etc/claude-code/.claude/skills', scope: 'administrator', tools: ['Claude Code'] })
+  if (process.platform !== 'win32') roots.push({ dir: '/etc/codex/skills', scope: 'administrator', tools: ['Codex'] })
+  // Plugins: Claude Code's own registry, then the newest copy of each plugin in
+  // Codex's cache, then Gemini CLI's extensions. A plugin's skill is named
+  // plugin:name, as Claude Code names it.
+  const reg = readJson(path.join(home, '.claude', 'plugins', 'installed_plugins.json'))
+  const plugins = reg && typeof reg.plugins === 'object' && reg.plugins ? reg.plugins : {}
+  for (const key of Object.keys(plugins).sort(byteOrder)) {
+    const entries = Array.isArray(plugins[key]) ? plugins[key] : [plugins[key]]
+    for (const e of entries) {
+      if (e && typeof e.installPath === 'string') roots.push({ dir: path.join(e.installPath, 'skills'), scope: 'plugin', tools: ['Claude Code'], plugin: key.split('@')[0] })
+    }
+  }
+  const codexCache = path.join(home, '.codex', 'plugins', 'cache')
+  for (const market of subdirs(codexCache)) {
+    for (const plugin of subdirs(path.join(codexCache, market))) {
+      const versions = subdirs(path.join(codexCache, market, plugin))
+      if (versions.length) roots.push({ dir: path.join(codexCache, market, plugin, versions[versions.length - 1], 'skills'), scope: 'plugin', tools: ['Codex'], plugin })
+    }
+  }
+  const gemExt = path.join(home, '.gemini', 'extensions')
+  for (const ext of subdirs(gemExt)) roots.push({ dir: path.join(gemExt, ext, 'skills'), scope: 'plugin', tools: ['Gemini CLI'], plugin: ext })
+  // The projects Claude Code knows, bounded.
+  const cj = readJson(path.join(home, '.claude.json'))
+  const projects = cj && typeof cj.projects === 'object' && !Array.isArray(cj.projects) && cj.projects ? Object.keys(cj.projects).filter(Boolean).sort(byteOrder).slice(0, 100) : []
+  for (const root of projects) {
+    for (const [sub, tools] of [
+      [path.join('.claude', 'skills'), ['Claude Code', 'Cursor', 'Copilot']],
+      [path.join('.agents', 'skills'), ['Codex', 'Cursor', 'Copilot', 'Gemini CLI']],
+      [path.join('.cursor', 'skills'), ['Cursor']],
+      [path.join('.github', 'skills'), ['Copilot']],
+      [path.join('.gemini', 'skills'), ['Gemini CLI']],
+    ]) {
+      const dir = path.join(root, sub)
+      if (!roots.some(r => r.dir === dir)) roots.push({ dir, scope: 'project', tools, project: root })
+    }
+  }
+  return roots
+}
+
+// The description line of a SKILL.md's front matter.
+function skillDescription (text) {
+  const lines = String(text).slice(0, 64 * 1024).split('\n').map(l => l.replace(/\r$/, ''))
+  if (lines[0] !== '---') return null
+  for (let i = 1; i < lines.length && lines[i] !== '---'; i++) {
+    if (!lines[i].startsWith('description:')) continue
+    const v = lines[i].slice('description:'.length).trim().replace(/^["']|["']$/g, '')
+    return v ? v.slice(0, 300) : null
+  }
+  return null
+}
+
+// The version of a skill's files, as the plugins compute it.
+function skillVersion (dir) {
+  const files = []
+  let bytes = 0, partial = false
+  const walk = (d) => {
+    for (const ent of fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => byteOrder(a.name, b.name))) {
+      if (SKILL_SKIP.has(ent.name)) continue
+      const abs = path.join(d, ent.name)
+      const st = fs.lstatSync(abs)
+      if (st.isSymbolicLink()) continue
+      if (st.isDirectory()) { walk(abs); continue }
+      if (!st.isFile()) continue
+      if (files.length >= SKILL_MAX_FILES) { partial = true; continue }
+      const buf = fs.readFileSync(abs)
+      if (bytes + buf.length > SKILL_MAX_BYTES) { partial = true; continue }
+      bytes += buf.length
+      files.push({ path: path.relative(dir, abs).split(path.sep).join('/'), sha256: sha256(buf) })
+    }
+  }
+  let description = null
+  try {
+    walk(dir)
+    description = skillDescription(fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8'))
+  } catch { return { fingerprint: null, files: files.length, partial: true, description: null } }
+  files.sort((a, b) => byteOrder(a.path, b.path))
+  return { fingerprint: sha256(files.map(f => `${f.path}\0${f.sha256}\n`).join('')), files: files.length, partial, description }
+}
+
+function skillsOnMachine (home) {
+  const out = []
+  const seen = new Set()
+  for (const r of skillRootsOnMachine(home)) {
+    for (const n of subdirs(r.dir)) {
+      const dir = path.join(r.dir, n)
+      if (seen.has(dir)) continue
+      let st
+      try { st = fs.lstatSync(dir) } catch { continue }
+      if (st.isSymbolicLink() || !fs.existsSync(path.join(dir, 'SKILL.md'))) continue
+      seen.add(dir)
+      out.push({
+        name: r.plugin ? `${r.plugin}:${n}` : n,
+        scope: r.scope,
+        tools: r.tools,
+        project: r.project || null,
+        path: dir,
+        ...skillVersion(dir),
+        // Written by the Clevr plugin as the workspace distributed it.
+        clevr: fs.existsSync(path.join(dir, '.clevr-skill.json')),
+      })
+      if (out.length >= SKILLS_MAX) return out
+    }
+  }
+  return out
+}
+
+function printSkills (skills) {
+  if (!skills.length) return
+  console.log(`${'-'.repeat(70)}`)
+  console.log('Skills on this machine')
+  for (const s of skills.slice(0, 40)) {
+    const where = s.scope === 'project' ? `project ${s.project}` : s.scope
+    console.log(`[${s.clevr ? 'CLEVR   ' : 'SKILL   '}] ${s.name}  (${where}; ${s.tools.join(', ')})  ${s.fingerprint ? s.fingerprint.slice(0, 12) : 'unreadable'}`)
+  }
+  if (skills.length > 40) console.log(`and ${skills.length - 40} more`)
+  console.log('Read, never written. Each skill is listed with the version of its files; whether that')
+  console.log('version is approved, and which agents may load it, is answered in Clevr.')
+}
+
 function machineSignals () {
   const home = os.homedir()
   const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming')
@@ -536,7 +696,7 @@ function machineSignals () {
       if (r.governed) { harnessGateway[id] = { ...r, file: f }; break }
     }
   }
-  return { llmGateway, mcp, hook, harnessGateway, wrapperGate, mcpJson: mcpJsonServers(home), extensions: browserExtensions(home, appData) }
+  return { llmGateway, mcp, hook, harnessGateway, wrapperGate, mcpJson: mcpJsonServers(home), extensions: browserExtensions(home, appData), skills: skillsOnMachine(home) }
 }
 
 function assess (entry, sig) {
@@ -783,6 +943,7 @@ function printReport (report) {
   if (shadowJson.length) console.log(`Plus ${shadowJson.length} MCP server${shadowJson.length === 1 ? '' : 's'} declared in a .mcp.json with no evidence of governance.`)
   printMcpJson(mj)
   printExtensions(report.machine?.extensions || [])
+  printSkills(report.machine?.skills || [])
   console.log()
 }
 
