@@ -41,6 +41,26 @@ A client's config counts as governed when an MCP entry points at the host of
 `CLEVR_GATEWAY_URL` **or** of `CLEVR_MCP_URL`, so the Clevr MCP server can be published
 on its own host without the machines reading as ungoverned.
 
+## Session key custody
+
+```bash
+clevr-endpoint --custody            # macOS and Linux, the standalone binary
+clevr-endpoint --custody --install  # also write a login item (LaunchAgent / systemd user unit)
+```
+
+Holds the session keys of the harness hooks in memory, so a model running
+commands as the user cannot read them from a file. It listens on
+`~/.clevr/custody.sock` (`CLEVR_CUSTODY_SOCK`), mode 0600, one JSON request per
+connection: `open` makes a key for a session and answers its public half, `sign`
+signs that session's signing string. A key signs only for a process that runs
+under the harness process that opened the session, read from the kernel (the
+peer's pid on the socket, then the process table: pid, parent, start time). No
+request returns a key, nothing is written to disk, keys go when their harness
+exits or after a day unused. The Node `.mjs` cannot learn the peer of a local
+socket and points to the binary. Windows: not yet. See the Sessions page of
+the Clevr API documentation (`POST /v1/sessions`, "Keep the key out of the
+model's reach") and `go/custody.go`.
+
 ## What it detects
 
 Claude Desktop, ChatGPT desktop, ChatGPT Atlas, Perplexity, Comet, Microsoft Copilot, Cursor, Windsurf, Kiro, Trae, Claude Code, Codex and its computer-use agent, Gemini CLI, GitHub Copilot CLI, Augment, Goose, OpenCode, Aider, AnythingLLM, and the local model runners Ollama, LM Studio, Jan, GPT4All and Msty, plus heuristic Python and Node agents. Raycast,

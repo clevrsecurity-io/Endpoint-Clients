@@ -6,6 +6,7 @@
 //	clevr-endpoint --report   also POST it to Clevr (needs CLEVR_URL + CLEVR_API_KEY)
 //	clevr-endpoint --json     machine-readable output
 //	clevr-endpoint --watch    re-run every CLEVR_INTERVAL seconds (default 300)
+//	clevr-endpoint --custody  hold session keys for the harness hooks (custody.go)
 //
 // It lists the AI clients running on this machine and, for each, whether there is
 // evidence it routes through Clevr (an LLM gateway base URL, or a Clevr-fronted MCP
@@ -39,7 +40,7 @@ import (
 	"unicode/utf16"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 var (
 	clevrURL   = os.Getenv("CLEVR_URL")
@@ -2114,6 +2115,11 @@ func main() {
 	// --identify <path>: how this agent recognises one executable or application.
 	if hasArg("--identify") {
 		identifyAndExit()
+	}
+	// --custody: hold session keys for the harness hooks (custody.go).
+	if hasArg("--custody") {
+		runCustody()
+		return
 	}
 	runOnce()
 	if hasArg("--watch") {

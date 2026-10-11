@@ -31,7 +31,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const VERSION = '0.3.0'
+const VERSION = '0.4.0'
 const args = new Set(process.argv.slice(2))
 const CLEVR_URL = process.env.CLEVR_URL || ''
 const CLEVR_KEY = process.env.CLEVR_API_KEY || ''
@@ -1887,6 +1887,14 @@ if (args.has('--identify')) {
   const hit = byName ? { entry: byName, by: 'its name' } : entryOfIdentity(ident)
   console.log(JSON.stringify({ path: file, identity: ident, client: hit ? { id: hit.entry.id, label: hit.entry.label, by: hit.by } : null }, null, 2))
   process.exit(0)
+}
+
+// --custody: session key custody needs the kernel to name the process at the
+// other end of a local socket, which Node does not expose. The Go binary does
+// it (go/custody.go).
+if (args.has('--custody')) {
+  console.error('Session key custody runs in the standalone binary: clevr-endpoint --custody (see README).')
+  process.exit(2)
 }
 
 await runOnce()
