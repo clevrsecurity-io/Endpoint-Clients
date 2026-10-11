@@ -31,7 +31,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const VERSION = '0.4.0'
+const VERSION = '0.5.0'
 const args = new Set(process.argv.slice(2))
 const CLEVR_URL = process.env.CLEVR_URL || ''
 const CLEVR_KEY = process.env.CLEVR_API_KEY || ''

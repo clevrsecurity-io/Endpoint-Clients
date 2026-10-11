@@ -22,10 +22,13 @@
 // through the hook; it cannot carry the key away, and it cannot sign for a
 // session another harness opened.
 //
+// On Windows the socket is a named pipe (\\.\pipe\clevr-custody-<user>) that
+// only this user can open and no other machine can reach, and the kernel names
+// the client process (GetNamedPipeClientProcessId); see custody_windows.go.
+//
 // Not covered, said plainly: a process of the same user that can read this
-// one's memory (root, a debugger the user allowed, Linux with ptrace_scope 0),
-// and Windows, which has no peer process on a local socket in Go's standard
-// library: --custody refuses to start there.
+// one's memory (an administrator, a debugger the user allowed, Linux with
+// ptrace_scope 0).
 package main
 
 import (
@@ -39,6 +42,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +53,15 @@ const custodyIdle = 24 * time.Hour
 type procInfo struct {
 	pid, ppid   int
 	start, name string
+	// The start as a number that orders processes (0 when unknown): a parent
+	// started after its child is not its parent but a later process that took
+	// a freed pid, which Windows hands out again while the child still names it.
+	startN int64
+}
+
+// Whether p can be the parent of child, by start order when both are known.
+func startedBefore(p, child procInfo) bool {
+	return p.startN == 0 || child.startN == 0 || p.startN <= child.startN
 }
 
 type custodyKey struct {
@@ -82,11 +95,17 @@ func newCustody() *custody {
 	return &custody{keys: map[string]*custodyKey{}, table: processTable, now: time.Now}
 }
 
-var shells = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true, "fish": true, "ksh": true, "tcsh": true, "csh": true, "pwsh": true, "powershell": true, "cmd.exe": true}
+var shells = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true, "fish": true, "ksh": true, "tcsh": true, "csh": true, "pwsh": true, "powershell": true, "cmd": true}
 
+// A process's name without its folder, the "-" of a login shell or the ".exe"
+// of Windows, in lower case: "C:\\Program Files\\Git\\bin\\bash.exe" reads "bash".
 func baseName(p string) string {
-	n := filepath.Base(strings.TrimSpace(p))
-	return strings.TrimPrefix(n, "-") // a login shell reads "-zsh"
+	n := strings.TrimSpace(p)
+	if i := strings.LastIndexAny(n, `/\`); i >= 0 {
+		n = n[i+1:]
+	}
+	n = strings.ToLower(strings.TrimPrefix(n, "-")) // a login shell reads "-zsh"
+	return strings.TrimSuffix(n, ".exe")
 }
 
 // The harness a hook runs under: its first ancestor that is not a shell. The
@@ -96,11 +115,13 @@ func harnessOf(peer int, tab map[int]procInfo) (procInfo, bool) {
 	if !ok {
 		return procInfo{}, false
 	}
+	child := p
 	cur, ok := tab[p.ppid]
-	for i := 0; ok && i < 16 && cur.pid > 1; i++ {
+	for i := 0; ok && i < 16 && cur.pid > 1 && startedBefore(cur, child); i++ {
 		if !shells[baseName(cur.name)] {
 			return cur, true
 		}
+		child = cur
 		cur, ok = tab[cur.ppid]
 	}
 	return procInfo{}, false
@@ -113,7 +134,11 @@ func descendsFrom(peer int, h procInfo, tab map[int]procInfo) bool {
 		if cur.pid == h.pid {
 			return cur.start == h.start
 		}
-		cur, ok = tab[cur.ppid]
+		parent, pok := tab[cur.ppid]
+		if !pok || !startedBefore(parent, cur) {
+			return false
+		}
+		cur = parent
 	}
 	return false
 }
@@ -204,58 +229,64 @@ func custodySocketPath() string {
 	if p := os.Getenv("CLEVR_CUSTODY_SOCK"); p != "" {
 		return p
 	}
+	if runtime.GOOS == "windows" {
+		return `\\.\pipe\clevr-custody-` + pipeUser(os.Getenv("USERNAME"))
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".clevr", "custody.sock")
 }
 
+// A user name as a pipe name accepts it, the same in the plugin (clevr-common.mjs).
+func pipeUser(u string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(u) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "user"
+	}
+	return b.String()
+}
+
+// One request line from the process `peer` (as the kernel named it; <= 0 when
+// it could not), one answer line.
+func (c *custody) respond(line []byte, peer int) []byte {
+	answer := func(v map[string]any) []byte { b, _ := json.Marshal(v); return append(b, '\n') }
+	if peer <= 0 {
+		return answer(map[string]any{"error": "the caller could not be identified"})
+	}
+	var req custodyReq
+	if json.Unmarshal(line, &req) != nil {
+		return answer(map[string]any{"error": "unreadable request"})
+	}
+	out, err := c.handle(req, peer)
+	if err != nil {
+		return answer(map[string]any{"error": err.Error()})
+	}
+	return answer(out)
+}
+
+// A local socket connection (macOS, Linux).
 func (c *custody) serve(conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	reply := func(v map[string]any) { b, _ := json.Marshal(v); _, _ = conn.Write(append(b, '\n')) }
 	peer, err := peerPID(conn)
-	if err != nil || peer <= 0 {
-		reply(map[string]any{"error": "the caller could not be identified"})
-		return
+	if err != nil {
+		peer = 0
 	}
 	line, err := bufio.NewReaderSize(conn, 16<<10).ReadBytes('\n')
 	if err != nil && len(line) == 0 {
 		return
 	}
-	var req custodyReq
-	if json.Unmarshal(line, &req) != nil {
-		reply(map[string]any{"error": "unreadable request"})
-		return
-	}
-	out, err := c.handle(req, peer)
-	if err != nil {
-		reply(map[string]any{"error": err.Error()})
-		return
-	}
-	reply(out)
+	_, _ = conn.Write(c.respond(line, peer))
 }
 
 func runCustody() {
-	if !custodySupported {
-		fmt.Fprintln(os.Stderr, "Session key custody is not available on this platform yet (macOS and Linux only).")
-		os.Exit(2)
-	}
-	path := custodySocketPath()
-	_ = os.MkdirAll(filepath.Dir(path), 0o700)
-	_ = os.Chmod(filepath.Dir(path), 0o700)
-	if conn, err := net.DialTimeout("unix", path, time.Second); err == nil {
-		conn.Close()
-		fmt.Fprintln(os.Stderr, "Session key custody is already running on", path)
-		os.Exit(0)
-	}
-	_ = os.Remove(path)
-	ln, err := net.Listen("unix", path)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "custody: cannot listen on", path, err)
-		os.Exit(1)
-	}
-	_ = os.Chmod(path, 0o600)
-	if hasArg("--install") {
-		installCustody()
+	if hasArg("--help") || hasArg("-h") {
+		fmt.Println("clevr-endpoint --custody [--install]: hold the session keys of the harness hooks in memory, on", custodySocketPath())
+		return
 	}
 	c := newCustody()
 	go func() {
@@ -263,12 +294,5 @@ func runCustody() {
 			c.sweep()
 		}
 	}()
-	fmt.Fprintf(os.Stderr, "Session key custody on %s. Keys are held in memory only.\n", path)
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			continue
-		}
-		go c.serve(conn)
-	}
+	listenCustody(c, custodySocketPath()) // custody_unix.go, custody_windows.go
 }

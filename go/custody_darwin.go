@@ -12,9 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
-
-const custodySupported = true
 
 // The pid at the other end of a local socket, from the kernel (LOCAL_PEERPID).
 func peerPID(conn net.Conn) (int, error) {
@@ -54,7 +53,12 @@ func processTable() (map[int]procInfo, error) {
 		if e1 != nil || e2 != nil {
 			continue
 		}
-		tab[pid] = procInfo{pid: pid, ppid: ppid, start: strings.Join(f[2:7], " "), name: strings.Join(f[7:], " ")}
+		start := strings.Join(f[2:7], " ")
+		var n int64
+		if t, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", start, time.Local); err == nil {
+			n = t.Unix()
+		}
+		tab[pid] = procInfo{pid: pid, ppid: ppid, start: start, startN: n, name: strings.Join(f[7:], " ")}
 	}
 	return tab, nil
 }

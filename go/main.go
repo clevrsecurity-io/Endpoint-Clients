@@ -40,7 +40,7 @@ import (
 	"unicode/utf16"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 var (
 	clevrURL   = os.Getenv("CLEVR_URL")

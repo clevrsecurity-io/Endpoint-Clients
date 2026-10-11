@@ -13,8 +13,6 @@ import (
 	"syscall"
 )
 
-const custodySupported = true
-
 // The pid at the other end of a local socket, from the kernel (SO_PEERCRED).
 func peerPID(conn net.Conn) (int, error) {
 	uc, ok := conn.(*net.UnixConn)
@@ -71,7 +69,8 @@ func processTable() (map[int]procInfo, error) {
 			continue
 		}
 		ppid, _ := strconv.Atoi(f[1])
-		tab[pid] = procInfo{pid: pid, ppid: ppid, start: f[19], name: s[open+1 : close]}
+		n, _ := strconv.ParseInt(f[19], 10, 64)
+		tab[pid] = procInfo{pid: pid, ppid: ppid, start: f[19], startN: n, name: s[open+1 : close]}
 	}
 	return tab, nil
 }

@@ -44,8 +44,8 @@ on its own host without the machines reading as ungoverned.
 ## Session key custody
 
 ```bash
-clevr-endpoint --custody            # macOS and Linux, the standalone binary
-clevr-endpoint --custody --install  # also write a login item (LaunchAgent / systemd user unit)
+clevr-endpoint --custody            # macOS, Linux, Windows: the standalone binary
+clevr-endpoint --custody --install  # also set it to start at sign-in (LaunchAgent, systemd user unit, or the logon task to create on Windows)
 ```
 
 Holds the session keys of the harness hooks in memory, so a model running
@@ -56,8 +56,13 @@ signs that session's signing string. A key signs only for a process that runs
 under the harness process that opened the session, read from the kernel (the
 peer's pid on the socket, then the process table: pid, parent, start time). No
 request returns a key, nothing is written to disk, keys go when their harness
-exits or after a day unused. The Node `.mjs` cannot learn the peer of a local
-socket and points to the binary. Windows: not yet. See the Sessions page of
+exits or after a day unused. On Windows it is the named pipe
+`\\.\pipe\clevr-custody-<user>`, with an owner-only security descriptor,
+remote clients refused, and the client process named by
+GetNamedPipeClientProcessId; a parent started after its child is not taken for
+its parent, since Windows hands a dead process's pid out again (built and
+unit-tested, to verify on a Windows machine). The Node `.mjs` cannot learn the
+peer of a local socket and points to the binary. See the Sessions page of
 the Clevr API documentation (`POST /v1/sessions`, "Keep the key out of the
 model's reach") and `go/custody.go`.
 
