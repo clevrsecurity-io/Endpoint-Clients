@@ -1,8 +1,8 @@
 # Clevr endpoint agent
 
 A light, **userland**, cross-platform (macOS / Windows / Linux) agent that discovers
-the AI clients and agents running on a machine, flags **shadow AI** (an AI client
-running with no evidence it is governed by Clevr), and can **point those clients at
+the AI clients and agents running on a machine, names the control each one goes
+through or says it has **no evidence** of one, and can **point those clients at
 Clevr** by writing a Clevr MCP server into their own configuration. Discovery, then
 remediation, from the machine itself.
 
@@ -69,8 +69,8 @@ model's reach") and `go/custody.go`.
 ## What it detects
 
 Claude Desktop, ChatGPT desktop, ChatGPT Atlas, Perplexity, Comet, Microsoft Copilot, Cursor, Windsurf, Kiro, Trae, Claude Code, Codex and its computer-use agent, Gemini CLI, GitHub Copilot CLI, Augment, Goose, OpenCode, Aider, AnythingLLM, and the local model runners Ollama, LM Studio, Jan, GPT4All and Msty, plus heuristic Python and Node agents. Raycast,
-Warp and Zed, which carry AI among other things, are listed as **AI APP** and never
-counted as shadow AI: whether their AI is used cannot be seen from the machine.
+Warp and Zed, which carry AI among other things, are listed as **AI BUILT IN** and never
+counted among the clients with no evidence: whether their AI is used cannot be seen from the machine.
 
 An executable the names miss is read once more, from what the file carries and a
 rename keeps. On a Mac: the application it belongs to (the name and identifier in
@@ -82,12 +82,12 @@ Mistral AI under any name is reported as theirs. Linux reads names only. A maker
 updater or crash reporter belongs to its product when the product is there.
 The Windows reading follows PowerShell's documented process and version information and is not verified on a live Windows machine, so it can only add a find, never remove one. `--identify <path>` shows that reading for one file or application. For each client it reports:
 
-- **GOVERNED**: something actually gates this client. A hook in its harness, the MCP guard wrapping its servers, or an LLM gateway base URL on our host.
+- **HOOK**, **MCP GUARD**, **GATEWAY**: what gates this client, named: a hook in its harness, the MCP guard wrapping its servers, or an LLM gateway base URL on our host. None of them means every action is covered.
 
-  **The Clevr MCP server configured as a server is NOT this.** It exposes two tools, one to ask for a verdict and one to look a resource up. The client can ask; nothing obliges it to and nothing stops it when it does not. A machine with only the Clevr MCP server reads as shadow, with the Clevr MCP server named on its line, because calling it governed puts a green tag where Clevr gates nothing. What gates a client's own tools is the guard, which wraps the servers it already has.
+  **The Clevr MCP server configured as a server is NOT this.** It exposes two tools, one to ask for a verdict and one to look a resource up. The client can ask; nothing obliges it to and nothing stops it when it does not. A client with only the Clevr MCP server reads as no evidence, with the Clevr MCP server named on its line, because calling it governed puts a green tag where Clevr gates nothing. What gates a client's own tools is the guard, which wraps the servers it already has.
 - **LOCAL**: a local model runner (Ollama, LM Studio, Jan, GPT4All, Msty); there is no cloud gateway to route through, so govern its tool use via a local MCP proxy.
-- **AI APP**: an application with AI built in (Raycast, Warp, Zed); listed, not counted as shadow AI.
-- **SHADOW**: running, with no evidence it is governed.
+- **AI BUILT IN**: an application with AI built in (Raycast, Warp, Zed); listed, not counted among the clients with no evidence.
+- **NO EVIDENCE**: running, with no evidence in this scan that it goes through Clevr. That is not proof it is ungoverned: an older report or a control Clevr cannot read explains it too.
 
 The command-line harnesses are listed after the desktop applications on purpose,
 and matched on the end of the executable path. ChatGPT desktop ships a binary
@@ -118,7 +118,7 @@ from the same file, at the same depth, under the same rule.
 
 It also lists clients that are **installed but not running**, since a person can
 install an AI client and open it once a month while the machine carries it all
-the same. Those are counted beside the shadow figure rather than folded into it,
+the same. Those are counted beside the clients with no evidence rather than folded into them,
 so that number keeps its original meaning.
 
 ## Browser extensions
@@ -161,10 +161,10 @@ degrades to "not declared" rather than to a claim.
 The verdict reads the client's **MCP server list and nothing else**. The word
 "clevr" in a folder path, a plugin name, or an entry left pointing at a host that no
 longer exists does **not** count as governance. A config that cannot be parsed is an
-unknown, and unknown is reported as shadow with the reason on the line, so a machine
+unknown, and unknown is reported as no evidence with the reason on the line, so a machine
 cannot turn itself green by corrupting its own file.
 
-Reports land at `POST /v1/endpoints` and roll up into a fleet shadow-AI view.
+Reports land at `POST /v1/endpoints` and roll up into the fleet view, Agents > Machines in the console.
 
 ## Skills
 
@@ -230,7 +230,7 @@ Writing a setting is not the same as it holding, so the agent keeps a note in
 It records **everything it observes configured**, not only what it wrote itself.
 A hook installed by the CLI, by an administrator or by hand is exactly as worth
 watching, and a setting the agent never wrote used to vanish in silence: its
-removal read as plain shadow, with nothing to say the machine had ever been
+removal read as plain no evidence, with nothing to say the machine had ever been
 configured. Each record says whether this agent put it there, and the report
 repeats it rather than implying we did.
 
@@ -282,6 +282,25 @@ a machine that is ungoverned again minutes later. Quit the app and run again, or
 
 Push it with your MDM (Intune, Jamf, …) as a scheduled task / `launchd` / `systemd`
 timer running `node clevr-endpoint.mjs --report` every few minutes.
+
+## The protection in force, and the tier from the console
+
+Each report says which tier is in force on the machine, read from the managed
+settings file Claude Code really reads (`--json | jq .tier`): the tier's name,
+whether the hooks are locked, the sandbox, the network allowlist, where the
+hooks take their key from (the machine file `/etc/clevr/agent.env` or
+`C:\Program Files\Clevr\agent.env`, the person's own setup, or none), and
+which harness policies name Clevr (Claude Code, Cursor, Codex). The console
+keeps it per machine and tells the administrators when it falls.
+
+On a machine deployed with MDM, `CLEVR_URL` and `CLEVR_API_KEY` come from the
+machine file when the environment does not set them.
+
+Installed as `clevr-policy` (`clevr-policy.exe` on Windows), the binary is the
+policy helper Claude Code runs at each start and every five minutes: it asks
+Clevr for the machine's tier and prints the managed settings file with the
+tier's own settings replaced, or `{}` when Clevr does not answer, so the file
+applies as it is. See deploy/mdm in the Clevr repository.
 
 ## Standalone executables (no runtime)
 

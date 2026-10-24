@@ -40,12 +40,12 @@ import (
 	"unicode/utf16"
 )
 
-const version = "0.5.0"
+const version = "0.6.0"
 
 var (
-	clevrURL   = os.Getenv("CLEVR_URL")
-	clevrKey   = os.Getenv("CLEVR_API_KEY")
-	gatewayURL = firstNonEmpty(os.Getenv("CLEVR_GATEWAY_URL"), os.Getenv("CLEVR_URL"))
+	clevrURL   = firstNonEmpty(os.Getenv("CLEVR_URL"), machineVar("CLEVR_URL"))
+	clevrKey   = firstNonEmpty(os.Getenv("CLEVR_API_KEY"), machineVar("CLEVR_API_KEY"))
+	gatewayURL = firstNonEmpty(os.Getenv("CLEVR_GATEWAY_URL"), clevrURL)
 	mcpMarker  = strings.ToLower(firstNonEmpty(os.Getenv("CLEVR_MCP_MARKER"), "clevr"))
 	mcpEntry   = firstNonEmpty(os.Getenv("CLEVR_MCP_NAME"), "clevr")
 	clevrHost  = hostOf(gatewayURL)
@@ -556,12 +556,12 @@ func printMcpJson(rows []mcpJsonEntry) {
 		if r.Unparsed {
 			continue
 		}
-		tag := "SHADOW  "
+		tag := "NO EVIDENCE"
 		switch {
 		case r.Clevr:
-			tag = "CLEVR   "
+			tag = "CLEVR      "
 		case r.Approval == "disabled":
-			tag = "OFF     "
+			tag = "OFF        "
 		}
 		where := "user"
 		if r.Project != nil {
@@ -569,12 +569,12 @@ func printMcpJson(rows []mcpJsonEntry) {
 		}
 		fmt.Printf("[%s] %s  (%s, %s)  %s\n", tag, r.Name, r.Transport, r.Approval, where)
 		if r.Target != "" {
-			fmt.Printf("           - %s\n", r.Target)
+			fmt.Printf("              - %s\n", r.Target)
 		}
 	}
 	for _, r := range rows {
 		if r.Unparsed {
-			fmt.Printf("[UNREAD  ] %s could not be parsed, so what it declares is unknown\n", r.File)
+			fmt.Printf("[UNREAD     ] %s could not be parsed, so what it declares is unknown\n", r.File)
 		}
 	}
 	fmt.Println("These files are read, never written. A .mcp.json entry applies where that file applies,")
@@ -598,14 +598,14 @@ func printExtensions(exts []browserExt) {
 	fmt.Println(strings.Repeat("-", 70))
 	fmt.Println("Browser extensions")
 	for _, e := range ai {
-		tag := "AI      "
+		tag := "AI         "
 		if e.State == "disabled" {
-			tag = "AI, OFF "
+			tag = "AI, OFF    "
 		}
 		fmt.Printf("[%s] %s  (%s) can read %s\n", tag, e.Name, e.Browser, e.Reach)
-		fmt.Println("           - name matches a known AI assistant, which is a heuristic, not a verdict")
+		fmt.Println("              - name matches a known AI assistant, which is a heuristic, not a verdict")
 		if e.State != "enabled" {
-			fmt.Printf("           - %s\n", e.State)
+			fmt.Printf("              - %s\n", e.State)
 		}
 	}
 	if n := len(broad); n > 0 {
@@ -735,6 +735,8 @@ func listProcesses() []proc {
 		return nil
 	}
 	exes := psByPID("-axww", "-o", "pid=,comm=")
+	// An exited process waiting to be reaped is not a running agent.
+	states := psByPID("-axww", "-o", "pid=,stat=")
 	var ps []proc
 	for _, line := range strings.Split(string(out), "\n") {
 		t := strings.TrimSpace(line)
@@ -747,7 +749,20 @@ func listProcesses() []proc {
 			continue
 		}
 		pid, cmd := t[:sp], strings.TrimSpace(t[sp+1:])
+		if strings.HasPrefix(states[pid], "Z") {
+			continue
+		}
 		exe := exes[pid]
+		// Preserve launch aliases and paths with spaces, as the Node agent does.
+		if runtime.GOOS == "linux" {
+			raw, _ := os.ReadFile("/proc/" + pid + "/cmdline")
+			launched := strings.SplitN(string(raw), "\x00", 2)[0]
+			if filepath.IsAbs(launched) {
+				exe = launched
+			} else if actual, err := os.Readlink("/proc/" + pid + "/exe"); err == nil {
+				exe = actual
+			}
+		}
 		if exe == "" {
 			exe = cmd
 		}
@@ -1433,7 +1448,7 @@ func assess(e catEntry, sig machine) (monitored bool, via string, evidence []str
 		return false, "local", ev
 	}
 	if e.kind == "ai-feature" {
-		ev = append(ev, "An application with AI built in: whether its AI is used cannot be seen from the machine, so it is listed, not counted as shadow AI")
+		ev = append(ev, "An application with AI built in: whether its AI is used cannot be seen from the machine, so it is listed, not counted among the clients with no evidence")
 		return false, "feature", ev
 	}
 	// Stated after the verdict lines and never counted into them: a gate nobody
@@ -1721,24 +1736,24 @@ func printDrift(drift []driftItem) {
 	fmt.Println("Clevr settings that were configured here and are gone")
 	fmt.Println(strings.Repeat("-", 70))
 	for _, d := range gone {
-		fmt.Printf("[UNDONE  ] %s\n", d.Label)
+		fmt.Printf("[UNDONE     ] %s\n", d.Label)
 		what := kindLabel[d.Kind]
 		if what == "" {
 			what = "the Clevr entry"
 		}
 		if d.State == "removed" {
-			fmt.Printf("           - %s is gone from %s\n", what, d.File)
+			fmt.Printf("              - %s is gone from %s\n", what, d.File)
 		} else {
-			fmt.Printf("           - now points at %s in %s\n", d.Now, d.File)
+			fmt.Printf("              - now points at %s in %s\n", d.Now, d.File)
 		}
 		if d.By == "observed" {
-			fmt.Println("           - it was not written by this agent, only seen configured here before")
+			fmt.Println("              - it was not written by this agent, only seen configured here before")
 		}
 		seenVerb := "first seen"
 		if d.By == "agent" {
 			seenVerb = "applied"
 		}
-		line := fmt.Sprintf("           - %s %s", seenVerb, d.AppliedAt)
+		line := fmt.Sprintf("              - %s %s", seenVerb, d.AppliedAt)
 		if d.Since != "" {
 			line += fmt.Sprintf(", undone %s", d.Since)
 		}
@@ -1747,7 +1762,7 @@ func printDrift(drift []driftItem) {
 		}
 		fmt.Println(line)
 		if d.Likely != "" {
-			fmt.Printf("           - likely cause: %s\n", d.Likely)
+			fmt.Printf("              - likely cause: %s\n", d.Likely)
 		}
 	}
 	fmt.Println(strings.Repeat("-", 70))
@@ -1776,6 +1791,7 @@ type report struct {
 	Clients []client    `json:"clients"`
 	Summary summary     `json:"summary"`
 	Drift   []driftItem `json:"drift"`
+	Tier    *tierReport `json:"tier"`
 }
 
 func buildReport() report {
@@ -1897,7 +1913,7 @@ func buildReport() report {
 	}
 	return report{
 		Host: host, OS: runtime.GOOS, User: uname, Version: version,
-		TS: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), Machine: sig,
+		TS: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), Machine: sig, Tier: tierInForce(),
 		Clients: clients, Summary: summary{Running: running, Present: len(clients), Monitored: mon, Shadow: shadow, ShadowInstalled: shadowInstalled, Hooked: hooked},
 	}
 }
@@ -1918,35 +1934,36 @@ func printReport(r report) {
 		fmt.Println("No known AI clients detected running.")
 	}
 	for _, c := range r.Clients {
-		tag := "SHADOW  "
-		if c.Monitored {
-			tag = "GOVERNED"
-		} else if c.Kind == "local-model" {
-			tag = "LOCAL   "
-		} else if c.Kind == "ai-feature" {
-			tag = "AI APP  "
-		}
-		depth := ""
+		// Named by the control found, as the console names it, and the Node
+		// agent prints the same words: none of them is "protected", and no
+		// evidence is what this scan found, not proof of ungoverned.
+		tag := "NO EVIDENCE"
 		if c.Monitored {
 			switch c.Via {
 			case "hook":
-				depth = " via hook"
+				tag = "HOOK       "
 			case "mcp":
-				depth = " via MCP"
+				tag = "MCP GUARD  "
 			case "llm-gateway":
-				depth = " via gateway"
+				tag = "GATEWAY    "
+			default:
+				tag = "EVIDENCE   "
 			}
+		} else if c.Kind == "local-model" {
+			tag = "LOCAL      "
+		} else if c.Kind == "ai-feature" {
+			tag = "AI BUILT IN"
 		}
 		where := "installed, not running"
 		if c.Running {
 			where = "pid " + c.PID
 		}
-		fmt.Printf("[%s] %s  (%s, %s)%s\n", tag, c.Label, where, c.Kind, depth)
+		fmt.Printf("[%s] %s  (%s, %s)\n", tag, c.Label, where, c.Kind)
 		if !c.Running && c.InstalledAt != "" {
-			fmt.Printf("           - found at %s\n", c.InstalledAt)
+			fmt.Printf("              - found at %s\n", c.InstalledAt)
 		}
 		for _, e := range c.Evidence {
-			fmt.Printf("           - %s\n", e)
+			fmt.Printf("              - %s\n", e)
 		}
 	}
 	fmt.Println(strings.Repeat("-", 70))
@@ -1954,9 +1971,9 @@ func printReport(r report) {
 	if r.Summary.Hooked > 0 {
 		byHook = fmt.Sprintf(" (%d by hook)", r.Summary.Hooked)
 	}
-	fmt.Printf("Running: %d   Governed: %d%s   Shadow: %d\n", r.Summary.Running, r.Summary.Monitored, byHook, r.Summary.Shadow)
+	fmt.Printf("Running: %d   With evidence: %d%s   No evidence: %d\n", r.Summary.Running, r.Summary.Monitored, byHook, r.Summary.Shadow)
 	if r.Summary.Shadow > 0 {
-		fmt.Println("Shadow AI present: an AI client is running with no evidence it is governed by Clevr.")
+		fmt.Println("Needs review: an AI client is running with no evidence in this scan that it goes through Clevr.")
 	}
 	printExtensionsAfter := r.Machine.Extensions
 	if n := r.Summary.ShadowInstalled; n > 0 {
@@ -2112,6 +2129,11 @@ func runOnce() {
 }
 
 func main() {
+	// Installed as clevr-policy: the helper Claude Code runs (policy.go).
+	if policyMode() {
+		runPolicy()
+		return
+	}
 	// --identify <path>: how this agent recognises one executable or application.
 	if hasArg("--identify") {
 		identifyAndExit()
@@ -2449,9 +2471,9 @@ func printSkills(skills []skillOnMachine) {
 		if sk.Scope == "project" && sk.Project != nil {
 			where = "project " + *sk.Project
 		}
-		tag := "SKILL   "
+		tag := "SKILL      "
 		if sk.Clevr {
-			tag = "CLEVR   "
+			tag = "CLEVR      "
 		}
 		ver := "unreadable"
 		if sk.Fingerprint != nil {

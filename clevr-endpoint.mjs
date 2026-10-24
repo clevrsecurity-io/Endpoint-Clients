@@ -31,10 +31,25 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const VERSION = '0.5.0'
+const VERSION = '0.6.0'
 const args = new Set(process.argv.slice(2))
-const CLEVR_URL = process.env.CLEVR_URL || ''
-const CLEVR_KEY = process.env.CLEVR_API_KEY || ''
+// On a machine deploy/mdm installed, the engine and key are in a file only an
+// administrator can change, so the agent reports from a LaunchAgent or a task
+// that carries no environment.
+const MACHINE_FILE = process.platform === 'win32' ? 'C:\\Program Files\\Clevr\\agent.env' : '/etc/clevr/agent.env'
+function readMachineFile () {
+  let text
+  try { text = fs.readFileSync(MACHINE_FILE, 'utf8') } catch { return null }
+  const vars = {}
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*(?:export\s+)?(CLEVR_[A-Z_]+)\s*=\s*(.*?)\s*$/.exec(line)
+    if (m) vars[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2')
+  }
+  return vars
+}
+const MACHINE = readMachineFile()
+const CLEVR_URL = process.env.CLEVR_URL || MACHINE?.CLEVR_URL || ''
+const CLEVR_KEY = process.env.CLEVR_API_KEY || MACHINE?.CLEVR_API_KEY || ''
 const GATEWAY_URL = process.env.CLEVR_GATEWAY_URL || CLEVR_URL
 const MCP_MARKER = (process.env.CLEVR_MCP_MARKER || 'clevr').toLowerCase()
 
@@ -383,7 +398,20 @@ function listProcesses () {
     const cmds = byPid(['-axww', '-o', 'pid=,command='])
     let exes = new Map()
     try { exes = byPid(['-axww', '-o', 'pid=,comm=']) } catch { /* fall back to the command line below */ }
-    return [...cmds].map(([pid, cmd]) => ({ pid, cmd, exe: exes.get(pid) || cmd }))
+    // A zombie has exited; its retained executable name is not a running agent.
+    const states = byPid(['-axww', '-o', 'pid=,stat='])
+    return [...cmds].filter(([pid]) => !/^Z/.test(states.get(pid) || '')).map(([pid, cmd]) => {
+      let exe = exes.get(pid) || cmd
+      // Linux comm is a short name. NUL-delimited argv[0] preserves launch
+      // aliases and paths with spaces; the executable link is the fallback.
+      if (process.platform === 'linux') {
+        try {
+          const launched = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')[0]
+          exe = path.isAbsolute(launched) ? launched : fs.readlinkSync(`/proc/${pid}/exe`)
+        } catch { /* exited or inaccessible */ }
+      }
+      return { pid, cmd, exe }
+    })
   } catch { return [] }
 }
 
@@ -464,7 +492,17 @@ function gatewayGoverns (file) {
 
 // Read the hook and plugin declarations, nothing else. A marker anywhere in the
 // file is the mistake this whole component already made once.
-function hookGoverns (file) {
+// Which copy of a plugin Claude Code has installed, from its own registry
+// (installed_plugins.json: one entry, or several, per plugin@marketplace).
+function installedPlugin (home, key) {
+  const reg = home ? readJson(path.join(home, '.claude', 'plugins', 'installed_plugins.json')) : null
+  const entries = reg && reg.plugins && typeof reg.plugins === 'object' ? reg.plugins[key] : null
+  const e = Array.isArray(entries) ? entries[entries.length - 1] : entries
+  const version = e && typeof e.version === 'string' ? e.version.slice(0, 20) : null
+  return { id: String(key).split('@')[0].slice(0, 60), ...(version ? { version } : {}) }
+}
+
+function hookGoverns (file, home = null) {
   let doc
   try { doc = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return { governed: false } }
   if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return { governed: false }
@@ -472,7 +510,9 @@ function hookGoverns (file) {
   const plugins = doc.enabledPlugins
   if (plugins && typeof plugins === 'object') {
     for (const [name, on] of Object.entries(plugins)) {
-      if (on && name.toLowerCase().includes(MCP_MARKER)) return { governed: true, via: 'plugin ' + name }
+      // The plugin and its version travel with the verdict: the fleet view
+      // names the copy each machine runs (founder, 2026-10-22).
+      if (on && name.toLowerCase().includes(MCP_MARKER)) return { governed: true, via: 'plugin ' + name, plugin: installedPlugin(home, name) }
     }
   }
   // Hook declarations: an object of event -> entries, each naming a command. The
@@ -825,7 +865,7 @@ function printSkills (skills) {
   console.log('Skills on this machine')
   for (const s of skills.slice(0, 40)) {
     const where = s.scope === 'project' ? `project ${s.project}` : s.scope
-    console.log(`[${s.clevr ? 'CLEVR   ' : 'SKILL   '}] ${s.name}  (${where}; ${s.tools.join(', ')})  ${s.fingerprint ? s.fingerprint.slice(0, 12) : 'unreadable'}`)
+    console.log(`[${s.clevr ? 'CLEVR      ' : 'SKILL      '}] ${s.name}  (${where}; ${s.tools.join(', ')})  ${s.fingerprint ? s.fingerprint.slice(0, 12) : 'unreadable'}`)
   }
   if (skills.length > 40) console.log(`and ${skills.length - 40} more`)
   console.log('Read, never written. Each skill is listed with the version of its files; whether that')
@@ -860,7 +900,7 @@ function machineSignals () {
     hook[id] = { governed: false }
     for (const f of files) {
       if (!fs.existsSync(f)) continue
-      const r = hookGoverns(f)
+      const r = hookGoverns(f, home)
       if (r.governed) { hook[id] = { ...r, file: f, ...((id === 'codex' || id === 'chatgpt') && codexHooksUntrusted(home, f) ? { untrusted: true } : {}) }; break }
     }
   }
@@ -929,7 +969,7 @@ function assess (entry, sig) {
     return { monitored: false, via: 'local', evidence: ev }
   }
   if (entry.kind === 'ai-feature') {
-    ev.push('An application with AI built in: whether its AI is used cannot be seen from the machine, so it is listed, not counted as shadow AI')
+    ev.push('An application with AI built in: whether its AI is used cannot be seen from the machine, so it is listed, not counted among the clients with no evidence')
     return { monitored: false, via: 'feature', evidence: ev }
   }
   // Stated after the verdict lines and never counted into them: a gate nobody
@@ -944,7 +984,9 @@ function assess (entry, sig) {
   const monitored = !!(hooked || llm || enforcingMcp)
   if (monitored) via = hooked ? 'hook' : enforcingMcp ? 'mcp' : 'llm-gateway'
   if (!monitored) ev.push('No evidence this client routes through Clevr')
-  return { monitored, via, evidence: ev }
+  // The plugin that hooks it, and its version, when the harness is governed
+  // through one: the fleet view names the copy each machine runs.
+  return { monitored, via, evidence: ev, ...(hooked && hookSig.plugin ? { plugin: hookSig.plugin } : {}) }
 }
 
 // ── Build one posture report (fresh scan each call, so --watch re-detects).
@@ -1037,23 +1079,56 @@ const MANAGED_PATHS = process.platform === 'darwin'
     : ['/etc/claude-code/managed-settings.json']
 const LEGACY_WIN = 'C:\\ProgramData\\ClaudeCode\\managed-settings.json'
 
+// Where the hooks on this machine take their key from: the machine file
+// (deploy/mdm), the person's own setup, or nowhere. A machine file with no key
+// means every action is refused there.
+function hooksKey () {
+  if (MACHINE) return MACHINE.CLEVR_API_KEY ? 'machine' : 'missing'
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.clevr', 'config.json'), 'utf8'))
+    if (typeof c.key === 'string' && c.key) return 'person'
+  } catch { /* no setup of their own */ }
+  return 'none'
+}
+
 // Name the tier from what the file actually contains, by the few keys that
 // separate them. Deliberately structural rather than reading a label we wrote:
 // a label survives an edit that removes the protection under it.
+// Which harnesses an administrator's policy points at Clevr (deploy/mdm):
+// Claude Code's managed settings, Cursor's system hooks, Codex's requirements.
+const HARNESS_POLICIES = process.platform === 'darwin'
+  ? { cursor: '/Library/Application Support/Cursor/hooks.json', codex: '/etc/codex/requirements.toml' }
+  : process.platform === 'win32'
+    ? { cursor: 'C:\\ProgramData\\Cursor\\hooks.json', codex: 'C:\\ProgramData\\OpenAI\\Codex\\requirements.toml' }
+    : { cursor: '/etc/cursor/hooks.json', codex: '/etc/codex/requirements.toml' }
+const namesClevr = (p) => { try { return !!p && /clevr/i.test(fs.readFileSync(p, 'utf8')) } catch { return false } }
+
 function tierInForce () {
   const found = MANAGED_PATHS.find(p => { try { return fs.existsSync(p) } catch { return false } })
   const misplaced = process.platform === 'win32' && (() => { try { return fs.existsSync(LEGACY_WIN) } catch { return false } })()
+  const key = hooksKey()
+  const harnesses = { claude_code: namesClevr(found), cursor: namesClevr(HARNESS_POLICIES.cursor), codex: namesClevr(HARNESS_POLICIES.codex) }
   if (!found) {
     return {
-      name: 'none', managed_settings: null, hooks_locked: false,
+      name: 'none', managed_settings: null, hooks_locked: false, key, harnesses,
       ...(misplaced ? { finding: 'A managed-settings.json exists at the legacy ProgramData path, which Claude Code does not read. It is not in force.' } : {}),
       note: 'No managed policy on this machine. Anything the agent is told not to do, it is told by a file its user can edit.'
     }
   }
   let m = null
   try { m = JSON.parse(fs.readFileSync(found, 'utf8')) } catch {
-    return { name: 'unreadable', managed_settings: found, hooks_locked: false,
+    return { name: 'unreadable', managed_settings: found, hooks_locked: false, key, harnesses,
       note: 'The managed settings file exists but is not valid JSON. Claude Code refuses to start on this, so the machine is not governed and not working.' }
+  }
+  // A profile that names a policy helper is applied as the helper builds it
+  // (endpoint-agent clevr-policy): read the tier from what Claude Code receives.
+  const helper = typeof m.policyHelper?.path === 'string' ? m.policyHelper.path : null
+  let fromConsole = false
+  if (helper) {
+    try {
+      const out = JSON.parse(execFileSync(helper, [], { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }))
+      if (out && typeof out.managedSettings === 'object') { m = out.managedSettings; fromConsole = true }
+    } catch { /* the helper did not answer: the profile applies */ }
   }
   const sb = m.sandbox || {}
   const name = sb.network?.strictAllowlist && m.allowManagedPermissionRulesOnly ? 'strict'
@@ -1068,9 +1143,12 @@ function tierInForce () {
     hooks_locked: m.allowManagedHooksOnly === true,
     sandbox: !!sb.enabled,
     network_allowlist: !!sb.network?.strictAllowlist,
-    bypass_disabled: m.permissions?.disableBypassPermissionsMode === true,
+    bypass_disabled: m.permissions?.disableBypassPermissionsMode === 'disable' || m.permissions?.disableBypassPermissionsMode === true,
     denied_reads: Array.isArray(m.permissions?.deny) ? m.permissions.deny.length : 0,
     failsafe: m.env?.CLEVR_FAILSAFE || null,
+    key,
+    harnesses,
+    ...(helper ? { policy_helper: true, from_console: fromConsole } : {}),
     ...(misplaced ? { finding: 'A second managed-settings.json sits at the legacy ProgramData path and is NOT read. Remove it so nobody reads it as policy.' } : {})
   }
 }
@@ -1089,9 +1167,9 @@ function printExtensions (exts) {
   console.log(`${'-'.repeat(70)}`)
   console.log('Browser extensions')
   for (const e of ai) {
-    console.log(`[${off(e) ? 'AI, OFF ' : 'AI      '}] ${e.name}  (${e.browser}) can read ${e.reach}`)
-    console.log('           - name matches a known AI assistant, which is a heuristic, not a verdict')
-    if (e.state !== 'enabled') console.log(`           - ${e.state}`)
+    console.log(`[${off(e) ? 'AI, OFF    ' : 'AI         '}] ${e.name}  (${e.browser}) can read ${e.reach}`)
+    console.log('              - name matches a known AI assistant, which is a heuristic, not a verdict')
+    if (e.state !== 'enabled') console.log(`              - ${e.state}`)
   }
   if (broadOthers.length) {
     console.log(`${broadOthers.length} other extension${broadOthers.length === 1 ? '' : 's'} can read every site: ${broadOthers.map(e => e.name).slice(0, 6).join(', ')}`)
@@ -1109,11 +1187,11 @@ function printMcpJson (rows) {
   console.log('MCP servers declared in .mcp.json')
   const label = (r) => r.project ? r.project : 'user'
   for (const r of real) {
-    const tag = r.clevr ? 'CLEVR   ' : r.approval === 'disabled' ? 'OFF     ' : 'SHADOW  '
+    const tag = r.clevr ? 'CLEVR      ' : r.approval === 'disabled' ? 'OFF        ' : 'NO EVIDENCE'
     console.log(`[${tag}] ${r.name}  (${r.transport}, ${r.approval})  ${label(r)}`)
-    if (r.target) console.log(`           - ${r.target}`)
+    if (r.target) console.log(`              - ${r.target}`)
   }
-  for (const r of bad) console.log(`[UNREAD  ] ${r.file} could not be parsed, so what it declares is unknown`)
+  for (const r of bad) console.log(`[UNREAD     ] ${r.file} could not be parsed, so what it declares is unknown`)
   console.log('These files are read, never written. A .mcp.json entry applies where that file applies,')
   console.log('so it is reported here rather than counted as governance for the whole machine.')
 }
@@ -1125,16 +1203,20 @@ function printReport (report) {
   console.log(`Clevr gateway: ${CLEVR_HOST || '(not configured)'}\n${'-'.repeat(70)}`)
   if (!clients.length) console.log('No known AI clients detected running.')
   for (const c of clients) {
-    const tag = c.monitored ? 'GOVERNED' : c.kind === 'local-model' ? 'LOCAL   ' : c.kind === 'ai-feature' ? 'AI APP  ' : 'SHADOW  '
-    const depth = c.via === 'hook' ? ' via hook' : c.via === 'mcp' ? ' via MCP' : c.via === 'llm-gateway' ? ' via gateway' : ''
+    // Named by the control found, as the console names it: a hook, a guard and
+    // a gateway block cover different things, and none of them is "protected".
+    // No evidence is what this scan found, not proof the client is ungoverned.
+    const tag = c.monitored
+      ? (c.via === 'hook' ? 'HOOK       ' : c.via === 'mcp' ? 'MCP GUARD  ' : c.via === 'llm-gateway' ? 'GATEWAY    ' : 'EVIDENCE   ')
+      : c.kind === 'local-model' ? 'LOCAL      ' : c.kind === 'ai-feature' ? 'AI BUILT IN' : 'NO EVIDENCE'
     const where = c.running ? `pid ${c.pid}` : 'installed, not running'
-    console.log(`[${tag}] ${c.label}  (${where}, ${c.kind})${c.monitored ? depth : ''}`)
-    if (!c.running && c.installedAt) console.log(`           - found at ${c.installedAt}`)
-    for (const e of c.evidence) console.log(`           - ${e}`)
+    console.log(`[${tag}] ${c.label}  (${where}, ${c.kind})`)
+    if (!c.running && c.installedAt) console.log(`              - found at ${c.installedAt}`)
+    for (const e of c.evidence) console.log(`              - ${e}`)
   }
   console.log(`${'-'.repeat(70)}`)
-  console.log(`Running: ${summary.running}   Governed: ${summary.monitored}${summary.hooked ? ` (${summary.hooked} by hook)` : ''}   Shadow: ${summary.shadow}`)
-  if (summary.shadow) console.log('Shadow AI present: an AI client is running with no evidence it is governed by Clevr.')
+  console.log(`Running: ${summary.running}   With evidence: ${summary.monitored}${summary.hooked ? ` (${summary.hooked} by hook)` : ''}   No evidence: ${summary.shadow}`)
+  if (summary.shadow) console.log('Needs review: an AI client is running with no evidence in this scan that it goes through Clevr.')
   if (summary.shadow_installed) console.log(`Plus ${summary.shadow_installed} AI client${summary.shadow_installed === 1 ? '' : 's'} installed on this machine, not running now, with no evidence of governance.`)
   const mj = report.machine?.mcpJson || []
   const shadowJson = mj.filter(r => !r.unparsed && !r.clevr && r.approval !== 'disabled')
@@ -1575,29 +1657,29 @@ function printPlan (plan, applied) {
   if (!plan.length) { console.log('No AI client detected on this machine.\n'); return }
   let restart = false
   for (const step of plan) {
-    if (step.action === 'cannot') { console.log(`[SKIP    ] ${step.label}\n           - ${step.reason}`); continue }
+    if (step.action === 'cannot') { console.log(`[SKIP       ] ${step.label}\n              - ${step.reason}`); continue }
     // The whole sentence lives in `via`. A fixed prefix like "already routed
     // through Clevr" contradicted the very case it introduced, where the Clevr MCP server is
     // configured and gates nothing.
-    if (step.action === 'already') { console.log(`[OK      ] ${step.label}\n           - ${step.via}`); continue }
-    if (step.result === 'failed') { console.log(`[FAILED  ] ${step.label}\n           - ${step.error}\n           - ${step.file}`); continue }
+    if (step.action === 'already') { console.log(`[OK         ] ${step.label}\n              - ${step.via}`); continue }
+    if (step.result === 'failed') { console.log(`[FAILED     ] ${step.label}\n              - ${step.error}\n              - ${step.file}`); continue }
     if (step.action === 'hook') {
-      console.log(`[${step.result === 'written' ? 'GOVERNED' : 'PLANNED '}] ${step.label}${step.running === false ? ' (not running)' : ''}`)
-      console.log(`           - ${step.result === 'written' ? 'installed the Clevr hook' : 'would install the Clevr hook'}, the deepest control here: every tool call before it runs, plus the conversation`)
-      console.log(`           - ${step.command}`)
-      if (step.output) console.log(`           - ${step.output}`)
+      console.log(`[${step.result === 'written' ? 'HOOK SET   ' : 'PLANNED    '}] ${step.label}${step.running === false ? ' (not running)' : ''}`)
+      console.log(`              - ${step.result === 'written' ? 'installed the Clevr hook' : 'would install the Clevr hook'}, the deepest control here: every tool call before it runs, plus the conversation`)
+      console.log(`              - ${step.command}`)
+      if (step.output) console.log(`              - ${step.output}`)
       if (step.result === 'written') restart = true
       continue
     }
     const verb = step.action === 'update' ? `repoint "${MCP_ENTRY_NAME}" from ${step.from}` : `add "${MCP_ENTRY_NAME}"`
-    console.log(`[${step.result === 'written' ? 'ADDED   ' : 'PLANNED '}] ${step.label}${step.running === false ? ' (not running)' : ''}`)
-    console.log(`           - ${step.result === 'written' ? 'wrote' : 'would'} ${verb} in ${step.file}`)
+    console.log(`[${step.result === 'written' ? 'ADDED      ' : 'PLANNED    '}] ${step.label}${step.running === false ? ' (not running)' : ''}`)
+    console.log(`              - ${step.result === 'written' ? 'wrote' : 'would'} ${verb} in ${step.file}`)
     // That server is not a gate, and the line has to say so or the plan reads as
     // remediation when it is an offer of advice.
-    console.log('           - this lets the client ASK Clevr for a verdict. It does not gate what the client does.')
-    if (step.guard) console.log(`           - to gate this client's own tools, wrap its servers with the guard: ${step.guard}`)
-    if (step.keeps.length) console.log(`           - leaves ${step.keeps.length} other MCP server(s) untouched: ${step.keeps.join(', ')}`)
-    if (step.backup) console.log(`           - backup: ${step.backup}`)
+    console.log('              - this lets the client ASK Clevr for a verdict. It does not gate what the client does.')
+    if (step.guard) console.log(`              - to gate this client's own tools, wrap its servers with the guard: ${step.guard}`)
+    if (step.keeps.length) console.log(`              - leaves ${step.keeps.length} other MCP server(s) untouched: ${step.keeps.join(', ')}`)
+    if (step.backup) console.log(`              - backup: ${step.backup}`)
     if (step.result === 'written') restart = true
   }
   console.log('-'.repeat(70))
@@ -1797,12 +1879,12 @@ function printDrift (drift) {
   console.log('Clevr settings that were configured here and are gone')
   console.log('-'.repeat(70))
   for (const d of gone) {
-    console.log(`[UNDONE  ] ${d.label}`)
+    console.log(`[UNDONE     ] ${d.label}`)
     const what = KIND_LABEL[d.kind] || 'the Clevr entry'
-    console.log(`           - ${d.state === 'removed' ? what + ' is gone from' : 'now points at ' + d.now + ' in'} ${d.file}`)
-    if (d.by === 'observed') console.log('           - it was not written by this agent, only seen configured here before')
-    console.log(`           - ${d.by === 'agent' ? 'applied' : 'first seen'} ${d.applied_at}${d.since ? `, undone ${d.since}` : ''}${d.reverts > 1 ? ` (${d.reverts} times in all)` : ''}`)
-    if (d.likely) console.log(`           - likely cause: ${d.likely}`)
+    console.log(`              - ${d.state === 'removed' ? what + ' is gone from' : 'now points at ' + d.now + ' in'} ${d.file}`)
+    if (d.by === 'observed') console.log('              - it was not written by this agent, only seen configured here before')
+    console.log(`              - ${d.by === 'agent' ? 'applied' : 'first seen'} ${d.applied_at}${d.since ? `, undone ${d.since}` : ''}${d.reverts > 1 ? ` (${d.reverts} times in all)` : ''}`)
+    if (d.likely) console.log(`              - likely cause: ${d.likely}`)
   }
   console.log('-'.repeat(70))
   console.log('Re-run with --govern --apply to put it back.\n')
