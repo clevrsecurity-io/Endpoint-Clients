@@ -815,6 +815,7 @@ type machine struct {
 	McpJson        []mcpJsonEntry    `json:"mcpJson"`
 	Extensions     []browserExt      `json:"extensions"`
 	Skills         []skillOnMachine  `json:"skills"`
+	Instructions   []instructionFile `json:"instructions"`
 }
 
 // A server declared in a .mcp.json. Surface, never a governance verdict: an
@@ -1346,6 +1347,7 @@ func machineSignals() machine {
 		McpJson:        mcpJsonServers(home),
 		Extensions:     browserExtensions(home, appData),
 		Skills:         skillsOnMachine(home),
+		Instructions:   instructionFilesOnMachine(home),
 		MCP: mcpSignals{
 			"claude-desktop": firstGoverned(claudeCfg),
 			"cursor":         firstGoverned(cursorCfg),
@@ -1999,6 +2001,7 @@ func printReport(r report) {
 	printMcpJson(r.Machine.McpJson)
 	printExtensions(printExtensionsAfter)
 	printSkills(r.Machine.Skills)
+	printInstructions(r.Machine.Instructions)
 	fmt.Println()
 }
 
@@ -2486,6 +2489,297 @@ func printSkills(skills []skillOnMachine) {
 	}
 	fmt.Println("Read, never written. Each skill is listed with the version of its files; whether that")
 	fmt.Println("version is approved, and which agents may load it, is answered in Clevr.")
+}
+
+// ── Instruction files on this machine ────────────────────────────────────────
+// The same reading as the Node agent's instructionFilesOnMachine: what each
+// coding tool reads as its instructions, for the person, the administrator and
+// each project ~/.claude.json and ~/.codex/config.toml know, a project's
+// subfolders read down four levels and four hundred folders at most. A
+// fingerprint and a size for each, never the text. Read, never written.
+type instructionFile struct {
+	Path        string   `json:"path"`
+	Scope       string   `json:"scope"`
+	Tools       []string `json:"tools"`
+	Project     *string  `json:"project"`
+	Repo        *string  `json:"repo"`
+	Fingerprint string   `json:"fingerprint"`
+	Bytes       int      `json:"bytes"`
+}
+
+const (
+	instrMax       = 300
+	instrFileMax   = 1024 * 1024
+	instrWalkDepth = 4
+	instrWalkDirs  = 400
+)
+
+var instrWalkSkip = map[string]bool{"node_modules": true, "vendor": true, "dist": true, "build": true, "target": true, "out": true, "coverage": true, "venv": true, "__pycache__": true}
+var agentsTools = []string{"Codex", "Cursor", "Copilot"}
+
+type instrName struct {
+	name  string
+	tools []string
+}
+
+var instrAtRoot = []instrName{
+	{"CLAUDE.md", []string{"Claude Code"}}, {"CLAUDE.local.md", []string{"Claude Code"}}, {filepath.Join(".claude", "CLAUDE.md"), []string{"Claude Code"}},
+	{"AGENTS.md", agentsTools}, {"AGENTS.override.md", []string{"Codex"}}, {"GEMINI.md", []string{"Gemini CLI"}},
+	{".cursorrules", []string{"Cursor"}}, {filepath.Join(".github", "copilot-instructions.md"), []string{"Copilot"}},
+}
+var instrNested = []instrName{{"CLAUDE.md", []string{"Claude Code"}}, {"AGENTS.md", agentsTools}, {"AGENTS.override.md", []string{"Codex"}}, {"GEMINI.md", []string{"Gemini CLI"}}}
+var instrRules = []struct {
+	sub   string
+	test  *regexp.Regexp
+	tools []string
+}{
+	{filepath.Join(".claude", "rules"), regexp.MustCompile(`\.md$`), []string{"Claude Code"}},
+	{filepath.Join(".cursor", "rules"), regexp.MustCompile(`\.mdc?$`), []string{"Cursor"}},
+	{filepath.Join(".github", "instructions"), regexp.MustCompile(`\.instructions\.md$`), []string{"Copilot"}},
+}
+
+var repoURLRx = regexp.MustCompile(`^[\w+.-]+://(?:[^@/]*@)?([^/:]+)(?::\d+)?/(.+?)(?:\.git)?/?$`)
+var repoSCPRx = regexp.MustCompile(`^(?:[^@/]*@)?([^/:]+):(.+?)(?:\.git)?/?$`)
+
+// The repository a project belongs to, as its origin names it without a
+// scheme, a user or a password, else the folder's name.
+func repoNameOf(remote, root string) string {
+	r := strings.TrimSpace(remote)
+	if r != "" {
+		m := repoURLRx.FindStringSubmatch(r)
+		if m == nil {
+			m = repoSCPRx.FindStringSubmatch(r)
+		}
+		if m != nil {
+			return m[1] + "/" + strings.TrimLeft(m[2], "/")
+		}
+	}
+	return filepath.Base(root)
+}
+
+var gitdirRx = regexp.MustCompile(`(?m)^gitdir:\s*(.+)$`)
+var urlLineRx = regexp.MustCompile(`^url\s*=\s*(.+)$`)
+
+func resolveFrom(base, p string) string {
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	return filepath.Join(base, p)
+}
+
+// The origin's address, read from the repository's own config.
+func originURLOf(root string) string {
+	gitDir := filepath.Join(root, ".git")
+	st, err := os.Stat(gitDir)
+	if err != nil {
+		return ""
+	}
+	if !st.IsDir() {
+		b, err := os.ReadFile(gitDir)
+		if err != nil {
+			return ""
+		}
+		m := gitdirRx.FindStringSubmatch(string(b))
+		if m == nil {
+			return ""
+		}
+		gitDir = resolveFrom(root, strings.TrimSpace(m[1]))
+	}
+	common := gitDir
+	if b, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
+		common = resolveFrom(gitDir, strings.TrimSpace(string(b)))
+	}
+	b, err := os.ReadFile(filepath.Join(common, "config"))
+	if err != nil {
+		return ""
+	}
+	inOrigin := false
+	for _, line := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "[") {
+			inOrigin = t == `[remote "origin"]`
+			continue
+		}
+		if inOrigin {
+			if m := urlLineRx.FindStringSubmatch(t); m != nil {
+				return strings.TrimSpace(m[1])
+			}
+		}
+	}
+	return ""
+}
+
+var codexProjectRx = regexp.MustCompile(`^\s*\[projects\."((?:[^"\\]|\\.)+)"\]\s*$`)
+var tomlEscapeRx = regexp.MustCompile(`\\(.)`)
+
+func instructionProjects(home string) []string {
+	var cj struct {
+		Projects map[string]json.RawMessage `json:"projects"`
+	}
+	if b, err := os.ReadFile(filepath.Join(home, ".claude.json")); err == nil {
+		_ = json.Unmarshal(b, &cj)
+	}
+	set := map[string]bool{}
+	for p := range cj.Projects {
+		if p != "" {
+			set[p] = true
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml")); err == nil {
+		for _, l := range strings.Split(string(b), "\n") {
+			if m := codexProjectRx.FindStringSubmatch(l); m != nil {
+				set[tomlEscapeRx.ReplaceAllString(m[1], "$1")] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	if len(out) > 100 {
+		out = out[:100]
+	}
+	return out
+}
+
+func filesUnder(dir string, test *regexp.Regexp, depth int) []string {
+	var out []string
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return out
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].Name() < ents[j].Name() })
+	for _, e := range ents {
+		abs := filepath.Join(dir, e.Name())
+		if e.IsDir() && depth > 0 {
+			out = append(out, filesUnder(abs, test, depth-1)...)
+		} else if e.Type().IsRegular() && test.MatchString(e.Name()) {
+			out = append(out, abs)
+		}
+	}
+	return out
+}
+
+// A project's subfolders, depth first in byte order, bounded.
+func projectSubdirs(root string) []string {
+	var out []string
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		if depth > instrWalkDepth {
+			return
+		}
+		for _, n := range skillSubdirs(dir) {
+			if len(out) >= instrWalkDirs {
+				return
+			}
+			if instrWalkSkip[n] {
+				continue
+			}
+			abs := filepath.Join(dir, n)
+			st, err := os.Lstat(abs)
+			if err != nil || st.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			out = append(out, abs)
+			walk(abs, depth+1)
+		}
+	}
+	walk(root, 1)
+	return out
+}
+
+func instructionFilesOnMachine(home string) []instructionFile {
+	out := []instructionFile{}
+	seen := map[string]bool{}
+	add := func(abs, shown, scope string, tools []string, project, repo *string) {
+		if len(out) >= instrMax || seen[abs] {
+			return
+		}
+		st, err := os.Lstat(abs)
+		if err != nil || !st.Mode().IsRegular() || st.Size() > instrFileMax {
+			return
+		}
+		b, err := os.ReadFile(abs)
+		if err != nil {
+			return
+		}
+		seen[abs] = true
+		sum := sha256.Sum256(b)
+		out = append(out, instructionFile{Path: shown, Scope: scope, Tools: tools, Project: project, Repo: repo, Fingerprint: hex.EncodeToString(sum[:]), Bytes: len(b)})
+	}
+	homeShown := func(abs string) string {
+		rel, _ := filepath.Rel(home, abs)
+		return "~/" + filepath.ToSlash(rel)
+	}
+	add(filepath.Join(home, ".claude", "CLAUDE.md"), "~/.claude/CLAUDE.md", "personal", []string{"Claude Code"}, nil, nil)
+	for _, f := range filesUnder(filepath.Join(home, ".claude", "rules"), regexp.MustCompile(`\.md$`), 3) {
+		add(f, homeShown(f), "personal", []string{"Claude Code"}, nil, nil)
+	}
+	add(filepath.Join(home, ".codex", "AGENTS.override.md"), "~/.codex/AGENTS.override.md", "personal", []string{"Codex"}, nil, nil)
+	add(filepath.Join(home, ".codex", "AGENTS.md"), "~/.codex/AGENTS.md", "personal", []string{"Codex"}, nil, nil)
+	add(filepath.Join(home, ".gemini", "GEMINI.md"), "~/.gemini/GEMINI.md", "personal", []string{"Gemini CLI"}, nil, nil)
+	add(filepath.Join(home, ".copilot", "copilot-instructions.md"), "~/.copilot/copilot-instructions.md", "personal", []string{"Copilot"}, nil, nil)
+	managed := "/etc/claude-code/CLAUDE.md"
+	if runtime.GOOS == "darwin" {
+		managed = "/Library/Application Support/ClaudeCode/CLAUDE.md"
+	} else if runtime.GOOS == "windows" {
+		managed = `C:\Program Files\ClaudeCode\CLAUDE.md`
+	}
+	add(managed, managed, "administrator", []string{"Claude Code"}, nil, nil)
+	for _, root := range instructionProjects(home) {
+		st, err := os.Stat(root)
+		if err != nil || !st.IsDir() {
+			continue
+		}
+		r := root
+		repo := repoNameOf(originURLOf(root), root)
+		rel := func(abs string) string {
+			p, _ := filepath.Rel(root, abs)
+			return filepath.ToSlash(p)
+		}
+		for _, n := range instrAtRoot {
+			add(filepath.Join(root, n.name), rel(filepath.Join(root, n.name)), "project", n.tools, &r, &repo)
+		}
+		for _, rl := range instrRules {
+			for _, f := range filesUnder(filepath.Join(root, rl.sub), rl.test, 3) {
+				add(f, rel(f), "project", rl.tools, &r, &repo)
+			}
+		}
+		// The home folder's own tree is never walked: it is not a project.
+		if filepath.Clean(root) == filepath.Clean(home) {
+			continue
+		}
+		for _, dir := range projectSubdirs(root) {
+			for _, n := range instrNested {
+				add(filepath.Join(dir, n.name), rel(filepath.Join(dir, n.name)), "project", n.tools, &r, &repo)
+			}
+		}
+	}
+	return out
+}
+
+func printInstructions(files []instructionFile) {
+	if len(files) == 0 {
+		return
+	}
+	fmt.Println(strings.Repeat("-", 70))
+	fmt.Println("Instruction files on this machine")
+	for i, f := range files {
+		if i == 40 {
+			break
+		}
+		where := f.Scope
+		if f.Scope == "project" && f.Project != nil {
+			where = "project " + *f.Project
+		}
+		fmt.Printf("[INSTRUCTIONS] %s  (%s; %s)  %s\n", f.Path, where, strings.Join(f.Tools, ", "), f.Fingerprint[:12])
+	}
+	if len(files) > 40 {
+		fmt.Printf("and %d more\n", len(files)-40)
+	}
+	fmt.Println("Read, never written. Each file is listed with a fingerprint of its content, never the text;")
+	fmt.Println("what the analysis finds in a file a governed session read is answered in Clevr.")
 }
 
 // ── Who an executable is, beyond its name ────────────────────────────────────

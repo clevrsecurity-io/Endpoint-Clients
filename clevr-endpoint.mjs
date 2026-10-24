@@ -859,6 +859,170 @@ function skillsOnMachine (home) {
   return out
 }
 
+// ── Instruction files on this machine ──────────────────────────────────────
+// What each coding tool reads as its instructions: CLAUDE.md and AGENTS.md and
+// their kin, the rules folders of Claude Code, Cursor and Copilot, GEMINI.md,
+// for the person, the administrator and each project. The Claude Code plugin
+// reports what a session read when it starts; this lists what sits on the
+// machine for every tool, Cursor, Copilot and Gemini CLI included, which have
+// no plugin to say so, and the CLAUDE.md of a project's subfolders, which
+// Claude Code reads only when the agent works there. A fingerprint and a size
+// for each, never the text. Read, never written.
+//
+// The projects are those ~/.claude.json and ~/.codex/config.toml already know,
+// as for the skills; inside one, its folders are read down four levels at most
+// and four hundred folders at most, leaving out the hidden ones and the
+// dependency and build folders. Never the disk, never the home folder's own
+// tree.
+const INSTR_MAX = 300
+const INSTR_FILE_MAX = 1024 * 1024
+const INSTR_WALK_DEPTH = 4
+const INSTR_WALK_DIRS = 400
+const INSTR_WALK_SKIP = new Set(['node_modules', 'vendor', 'dist', 'build', 'target', 'out', 'coverage', 'venv', '__pycache__'])
+const AGENTS_TOOLS = ['Codex', 'Cursor', 'Copilot']
+// At a project's root, in this order.
+const INSTR_AT_ROOT = [
+  ['CLAUDE.md', ['Claude Code']], ['CLAUDE.local.md', ['Claude Code']], [path.join('.claude', 'CLAUDE.md'), ['Claude Code']],
+  ['AGENTS.md', AGENTS_TOOLS], ['AGENTS.override.md', ['Codex']], ['GEMINI.md', ['Gemini CLI']],
+  ['.cursorrules', ['Cursor']], [path.join('.github', 'copilot-instructions.md'), ['Copilot']],
+]
+// In a project's subfolders.
+const INSTR_NESTED = [['CLAUDE.md', ['Claude Code']], ['AGENTS.md', AGENTS_TOOLS], ['AGENTS.override.md', ['Codex']], ['GEMINI.md', ['Gemini CLI']]]
+// The rules folders, and which files in them count.
+const INSTR_RULES = [
+  [path.join('.claude', 'rules'), /\.md$/, ['Claude Code']],
+  [path.join('.cursor', 'rules'), /\.mdc?$/, ['Cursor']],
+  [path.join('.github', 'instructions'), /\.instructions\.md$/, ['Copilot']],
+]
+
+// The repository a project belongs to, as its origin names it without a
+// scheme, a user or a password (github.com/acme/shop), else the folder's name.
+// The Claude Code plugin names it the same way, so both reports meet.
+function repoNameOf (remote, root) {
+  const r = String(remote || '').trim()
+  if (r) {
+    const m = /^[\w+.-]+:\/\/(?:[^@/]*@)?([^/:]+)(?::\d+)?\/(.+?)(?:\.git)?\/?$/.exec(r) || /^(?:[^@/]*@)?([^/:]+):(.+?)(?:\.git)?\/?$/.exec(r)
+    if (m) return `${m[1]}/${m[2].replace(/^\/+/, '')}`
+  }
+  return path.basename(root)
+}
+// The origin's address, read from the repository's own config: no git needed.
+function originUrlOf (root) {
+  let gitDir = path.join(root, '.git')
+  try {
+    if (fs.statSync(gitDir).isFile()) {
+      const m = /^gitdir:\s*(.+)$/m.exec(fs.readFileSync(gitDir, 'utf8'))
+      if (!m) return null
+      gitDir = path.resolve(root, m[1].trim())
+    }
+    let common = gitDir
+    try { common = path.resolve(gitDir, fs.readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim()) } catch { /* not a worktree */ }
+    let inOrigin = false
+    for (const line of fs.readFileSync(path.join(common, 'config'), 'utf8').split('\n')) {
+      const t = line.trim()
+      if (t.startsWith('[')) { inOrigin = t === '[remote "origin"]'; continue }
+      const m = inOrigin && /^url\s*=\s*(.+)$/.exec(t)
+      if (m) return m[1].trim()
+    }
+  } catch { /* no repository */ }
+  return null
+}
+// The projects Codex trusts, from its config: [projects."<path>"].
+function codexProjects (home) {
+  try {
+    return fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8').split('\n')
+      .map(l => /^\s*\[projects\."((?:[^"\\]|\\.)+)"\]\s*$/.exec(l)).filter(Boolean).map(m => m[1].replace(/\\(.)/g, '$1'))
+  } catch { return [] }
+}
+function instructionProjects (home) {
+  const cj = readJson(path.join(home, '.claude.json'))
+  const claude = cj && typeof cj.projects === 'object' && !Array.isArray(cj.projects) && cj.projects ? Object.keys(cj.projects) : []
+  return [...new Set([...claude, ...codexProjects(home)].filter(Boolean))].sort(byteOrder).slice(0, 100)
+}
+function filesUnder (dir, test, depth = 3) {
+  const out = []
+  let ents = []
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => byteOrder(a.name, b.name)) } catch { return out }
+  for (const e of ents) {
+    const abs = path.join(dir, e.name)
+    if (e.isDirectory() && depth > 0) out.push(...filesUnder(abs, test, depth - 1))
+    else if (e.isFile() && test.test(e.name)) out.push(abs)
+  }
+  return out
+}
+// A project's subfolders, depth first in byte order, bounded.
+function projectSubdirs (root) {
+  const out = []
+  const walk = (dir, depth) => {
+    if (depth > INSTR_WALK_DEPTH) return
+    for (const n of subdirs(dir)) {
+      if (out.length >= INSTR_WALK_DIRS) return
+      if (INSTR_WALK_SKIP.has(n)) continue
+      const abs = path.join(dir, n)
+      let st
+      try { st = fs.lstatSync(abs) } catch { continue }
+      if (st.isSymbolicLink()) continue
+      out.push(abs)
+      walk(abs, depth + 1)
+    }
+  }
+  walk(root, 1)
+  return out
+}
+
+function instructionFilesOnMachine (home) {
+  const out = []
+  const seen = new Set()
+  const add = (abs, shown, scope, tools, project = null, repo = null) => {
+    if (out.length >= INSTR_MAX || seen.has(abs)) return
+    let st
+    try { st = fs.lstatSync(abs) } catch { return }
+    if (!st.isFile() || st.size > INSTR_FILE_MAX) return
+    let buf
+    try { buf = fs.readFileSync(abs) } catch { return }
+    seen.add(abs)
+    out.push({ path: shown, scope, tools, project, repo, fingerprint: sha256(buf), bytes: buf.length })
+  }
+  const homeShown = (abs) => '~/' + path.relative(home, abs).split(path.sep).join('/')
+  add(path.join(home, '.claude', 'CLAUDE.md'), '~/.claude/CLAUDE.md', 'personal', ['Claude Code'])
+  for (const f of filesUnder(path.join(home, '.claude', 'rules'), /\.md$/)) add(f, homeShown(f), 'personal', ['Claude Code'])
+  add(path.join(home, '.codex', 'AGENTS.override.md'), '~/.codex/AGENTS.override.md', 'personal', ['Codex'])
+  add(path.join(home, '.codex', 'AGENTS.md'), '~/.codex/AGENTS.md', 'personal', ['Codex'])
+  add(path.join(home, '.gemini', 'GEMINI.md'), '~/.gemini/GEMINI.md', 'personal', ['Gemini CLI'])
+  add(path.join(home, '.copilot', 'copilot-instructions.md'), '~/.copilot/copilot-instructions.md', 'personal', ['Copilot'])
+  const managed = process.platform === 'darwin' ? '/Library/Application Support/ClaudeCode/CLAUDE.md'
+    : process.platform === 'win32' ? 'C:\\Program Files\\ClaudeCode\\CLAUDE.md' : '/etc/claude-code/CLAUDE.md'
+  add(managed, managed, 'administrator', ['Claude Code'])
+  for (const root of instructionProjects(home)) {
+    let st
+    try { st = fs.statSync(root) } catch { continue }
+    if (!st.isDirectory()) continue
+    const repo = repoNameOf(originUrlOf(root), root)
+    const rel = (abs) => path.relative(root, abs).split(path.sep).join('/')
+    for (const [name, tools] of INSTR_AT_ROOT) add(path.join(root, name), rel(path.join(root, name)), 'project', tools, root, repo)
+    for (const [sub, test, tools] of INSTR_RULES) for (const f of filesUnder(path.join(root, sub), test)) add(f, rel(f), 'project', tools, root, repo)
+    // The home folder's own tree is never walked: it is not a project.
+    if (path.resolve(root) === path.resolve(home)) continue
+    for (const dir of projectSubdirs(root)) {
+      for (const [name, tools] of INSTR_NESTED) add(path.join(dir, name), rel(path.join(dir, name)), 'project', tools, root, repo)
+    }
+  }
+  return out
+}
+
+function printInstructions (files) {
+  if (!files.length) return
+  console.log(`${'-'.repeat(70)}`)
+  console.log('Instruction files on this machine')
+  for (const f of files.slice(0, 40)) {
+    const where = f.scope === 'project' ? `project ${f.project}` : f.scope
+    console.log(`[INSTRUCTIONS] ${f.path}  (${where}; ${f.tools.join(', ')})  ${f.fingerprint.slice(0, 12)}`)
+  }
+  if (files.length > 40) console.log(`and ${files.length - 40} more`)
+  console.log('Read, never written. Each file is listed with a fingerprint of its content, never the text;')
+  console.log('what the analysis finds in a file a governed session read is answered in Clevr.')
+}
+
 function printSkills (skills) {
   if (!skills.length) return
   console.log(`${'-'.repeat(70)}`)
@@ -918,7 +1082,7 @@ function machineSignals () {
       if (r.governed) { harnessGateway[id] = { ...r, file: f }; break }
     }
   }
-  return { llmGateway, mcp, hook, harnessGateway, wrapperGate, mcpJson: mcpJsonServers(home), extensions: browserExtensions(home, appData), skills: skillsOnMachine(home) }
+  return { llmGateway, mcp, hook, harnessGateway, wrapperGate, mcpJson: mcpJsonServers(home), extensions: browserExtensions(home, appData), skills: skillsOnMachine(home), instructions: instructionFilesOnMachine(home) }
 }
 
 function assess (entry, sig) {
@@ -1224,6 +1388,7 @@ function printReport (report) {
   printMcpJson(mj)
   printExtensions(report.machine?.extensions || [])
   printSkills(report.machine?.skills || [])
+  printInstructions(report.machine?.instructions || [])
   console.log()
 }
 
