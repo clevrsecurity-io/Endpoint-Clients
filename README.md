@@ -66,6 +66,24 @@ peer of a local socket and points to the binary. See the Sessions page of
 the Clevr API documentation (`POST /v1/sessions`, "Keep the key out of the
 model's reach") and `go/custody.go`.
 
+### The machine's custody
+
+```bash
+clevr-endpoint --custody --system             # deploy/mdm runs it under its own account
+clevr-endpoint --custody --system --hardware  # a new machine key goes in the chip
+CLEVR_URL=... CLEVR_ENROLL_TOKEN=... clevr-endpoint --enroll
+```
+
+One custody per machine, under an account of its own (`_clevr` LaunchDaemon on
+macOS, `clevr` systemd service on Linux, the `ClevrCustody` service under
+`NT SERVICE\ClevrCustody` on Windows, never run there yet), holding the
+machine key out of the person's reach (`go/custody_system.go`). With
+`--hardware`, a machine that has no key yet gets it in the Secure Enclave
+(through `se-helper/`, built by `se-helper/build.sh` and installed beside the
+binary) or the TPM; elsewhere, or when the chip does not answer, in software.
+The report and the policy helper present a machine token instead of a key when
+the machine file names `CLEVR_MACHINE_ID` (`go/machinetoken.go`).
+
 ## What it detects
 
 Claude Desktop, ChatGPT desktop, ChatGPT Atlas, Perplexity, Comet, Microsoft Copilot, Cursor, Windsurf, Kiro, Trae, Claude Code, Codex and its computer-use agent, Gemini CLI, GitHub Copilot CLI, Augment, Goose, OpenCode, Aider, AnythingLLM, and the local model runners Ollama, LM Studio, Jan, GPT4All and Msty, plus heuristic Python and Node agents. Raycast,
@@ -319,7 +337,9 @@ dist\clevr-endpoint-windows-x64.exe --report       # Windows (PowerShell)
 ```
 
 The Go binary and the `.mjs` share the same signed wire contract, the same device key
-(stored as a raw seed, so a machine can switch between them with no key change), the
+(stored as a raw seed, so a machine can switch between them with no key change; on a
+machine where the Clevr daemon already made its journal key, `~/.clevr/local/journal-key.json`,
+the key made at the first report is that one, so the reports and the journal share a key), the
 same **detection** verdict and the same **undone** check, all verified case by case in
 `test_govern.mjs`. That last one matters for a fleet: apply once with the `.mjs` or the
 CLI, then let the MDM-pushed binary scan on a schedule, and it reads the same note and

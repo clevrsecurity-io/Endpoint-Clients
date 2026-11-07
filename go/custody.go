@@ -2,6 +2,8 @@
 //
 //	clevr-endpoint --custody            hold session keys for the hooks on this machine
 //	clevr-endpoint --custody --install  also write a login item that starts it
+//	clevr-endpoint --custody --system   the machine's custody, with its machine key (custody_system.go),
+//	                                    a Windows service there (custody_service_windows.go)
 //
 // A harness hook used to keep its session key in a 0600 file under the user's
 // account (integrations/claude-code/hooks/clevr-common.mjs), where a model
@@ -80,6 +82,12 @@ type custodyReq struct {
 	Digest    string `json:"digest"`
 	TS        int64  `json:"ts"`
 	Nonce     string `json:"nonce"`
+	// machine_sign (custody_system.go)
+	Purpose          string `json:"purpose"`
+	Challenge        string `json:"challenge"`
+	SessionPublicKey string `json:"session_public_key"`
+	Host             string `json:"host"`
+	MachineID        string `json:"machine_id"`
 }
 
 type custody struct {
@@ -89,7 +97,13 @@ type custody struct {
 	// test's.
 	table func() (map[int]procInfo, error)
 	now   func() time.Time
+	// The machine key: the system custody's only (--system).
+	machine *machineKey
 }
+
+// Whether a caller of another account is served: the system custody's socket
+// is open to every account, the per-user one to its own (custody_linux.go).
+var peerAnyAccount bool
 
 func newCustody() *custody {
 	return &custody{keys: map[string]*custodyKey{}, table: processTable, now: time.Now}
@@ -150,7 +164,18 @@ func sessionSigningString(sid, agent, digest string, ts int64, nonce string) str
 
 func (c *custody) handle(req custodyReq, peer int) (map[string]any, error) {
 	if req.Op == "hello" {
+		if c.machine != nil {
+			return map[string]any{"ok": true, "version": version, "custody": c.machine.level, "machine": true}, nil
+		}
 		return map[string]any{"ok": true, "version": version, "custody": "memory"}, nil
+	}
+	if c.machine != nil {
+		switch req.Op {
+		case "machine_key":
+			return map[string]any{"public_key": c.machine.pub, "alg": c.machine.alg, "custody": c.machine.level}, nil
+		case "machine_sign":
+			return c.machineSign(req, peer)
+		}
 	}
 	if req.SessionID == "" || len(req.SessionID) > 200 || req.Agent == "" || len(req.Agent) > 200 {
 		return nil, errors.New("session_id and agent are required")
@@ -284,15 +309,47 @@ func (c *custody) serve(conn net.Conn) {
 }
 
 func runCustody() {
+	system := hasArg("--system")
 	if hasArg("--help") || hasArg("-h") {
 		fmt.Println("clevr-endpoint --custody [--install]: hold the session keys of the harness hooks in memory, on", custodySocketPath())
+		fmt.Println("clevr-endpoint --custody --system: the machine's custody, run by deploy/mdm under its own account, with its machine key")
+		fmt.Println("clevr-endpoint --custody --system --hardware: a new machine key goes in the chip (Secure Enclave, TPM) where there is one")
 		return
 	}
 	c := newCustody()
-	go func() {
+	sweep := func() {
 		for range time.Tick(time.Hour) {
 			c.sweep()
 		}
-	}()
-	listenCustody(c, custodySocketPath()) // custody_unix.go, custody_windows.go
+	}
+	if !system {
+		go sweep()
+		listenCustody(c, custodySocketPath()) // custody_unix.go, custody_windows.go
+		return
+	}
+	path, keyPath := systemCustodySocketPath(), machineKeyPath()
+	if path == "" || keyPath == "" {
+		fmt.Fprintln(os.Stderr, "The system custody is available on macOS, Linux and Windows only.")
+		os.Exit(2)
+	}
+	if hasArg("--install") {
+		fmt.Fprintln(os.Stderr, "--install writes a login item for one person; the system custody is installed by deploy/mdm.")
+		os.Exit(2)
+	}
+	start := func() {
+		m, err := loadMachineKeyFrom(keyPath, platformChips(hasArg("--hardware")))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "custody:", err)
+			os.Exit(1)
+		}
+		c.machine = m
+		peerAnyAccount = true
+		go sweep()
+		listenCustody(c, path)
+	}
+	// Under the Windows service control manager (custody_service_windows.go),
+	// else as launchd or systemd start it.
+	if !runAsService(filepath.Dir(keyPath), start) {
+		start()
+	}
 }

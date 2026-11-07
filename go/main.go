@@ -1,12 +1,14 @@
 // Clevr endpoint agent — Go port of clevr-endpoint.mjs. Userland, cross-platform
-// (macOS / Windows / Linux), zero external deps (stdlib only) -> a ~10 MB static
-// binary, no runtime to install. Same behaviour and same wire contract as the .mjs:
+// (macOS / Windows / Linux), the standard library plus golang.org/x/sys/windows/svc
+// for the Windows service -> a ~10 MB static binary, no runtime to install. Same behaviour and same wire contract as the .mjs:
 //
 //	clevr-endpoint            print a posture report for this machine
-//	clevr-endpoint --report   also POST it to Clevr (needs CLEVR_URL + CLEVR_API_KEY)
+//	clevr-endpoint --report   also POST it to Clevr (needs CLEVR_URL + CLEVR_API_KEY, or a machine token)
 //	clevr-endpoint --json     machine-readable output
 //	clevr-endpoint --watch    re-run every CLEVR_INTERVAL seconds (default 300)
 //	clevr-endpoint --custody  hold session keys for the harness hooks (custody.go)
+//	clevr-endpoint --custody --system  the machine's custody, with its machine key (custody_system.go)
+//	clevr-endpoint --enroll   enrol this machine with the system custody (enroll.go)
 //
 // It lists the AI clients running on this machine and, for each, whether there is
 // evidence it routes through Clevr (an LLM gateway base URL, or a Clevr-fronted MCP
@@ -17,14 +19,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1794,6 +1799,46 @@ type report struct {
 	Summary summary     `json:"summary"`
 	Drift   []driftItem `json:"drift"`
 	Tier    *tierReport `json:"tier"`
+	// The machine's own addresses, so a DNS server's log can be matched to it
+	// (clevr discover --dns-log --machines). Reported context, never signed.
+	Addresses []string `json:"addresses"`
+}
+
+// Every address the machine holds on an interface that is up, as the Node
+// agent lists them (os.networkInterfaces): not the loopback, not link-local,
+// sorted, at most sixteen.
+func localAddresses() []string {
+	out := []string{}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return out
+	}
+	seen := map[string]bool{}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagRunning == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok || ipnet.IP.IsLoopback() || ipnet.IP.IsLinkLocalUnicast() || ipnet.IP.IsUnspecified() {
+				continue
+			}
+			s := ipnet.IP.String()
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	sort.Strings(out)
+	if len(out) > 16 {
+		out = out[:16]
+	}
+	return out
 }
 
 func buildReport() report {
@@ -1915,7 +1960,7 @@ func buildReport() report {
 	}
 	return report{
 		Host: host, OS: runtime.GOOS, User: uname, Version: version,
-		TS: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), Machine: sig, Tier: tierInForce(),
+		TS: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), Machine: sig, Tier: tierInForce(), Addresses: localAddresses(),
 		Clients: clients, Summary: summary{Running: running, Present: len(clients), Monitored: mon, Shadow: shadow, ShadowInstalled: shadowInstalled, Hooked: hooked},
 	}
 }
@@ -2021,6 +2066,45 @@ type keyFile struct {
 	Pub  string `json:"pub"`  // base64 of the raw 32-byte public key
 }
 
+// The Clevr daemon's journal key (brain/src/local/journal.ts), in the same
+// format. A machine where the daemon made its key before this agent made one
+// takes it, so the reports and the journal are signed by one key the centre
+// reads on both (docs-internal/fusion-agent-de-poste-2026-10-31.md). Only a
+// plain file of this account that no one else can read, whose public half is
+// its seed's; on Windows the mode is not read. The Node agent reads it the
+// same way (clevr-endpoint.mjs journalKeyOf).
+func journalKeyPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".clevr", "local", "journal-key.json")
+}
+
+func journalKey() (ed25519.PrivateKey, bool) {
+	fi, err := os.Lstat(journalKeyPath())
+	if err != nil || !fi.Mode().IsRegular() {
+		return nil, false
+	}
+	if runtime.GOOS != "windows" && (fi.Mode().Perm()&0o077 != 0 || !ownedByMe(fi)) {
+		return nil, false
+	}
+	b, err := os.ReadFile(journalKeyPath())
+	if err != nil {
+		return nil, false
+	}
+	var kf keyFile
+	if json.Unmarshal(b, &kf) != nil {
+		return nil, false
+	}
+	seed, err := base64.StdEncoding.DecodeString(kf.Seed)
+	if err != nil || len(seed) != ed25519.SeedSize {
+		return nil, false
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	if base64.StdEncoding.EncodeToString(priv.Public().(ed25519.PublicKey)) != kf.Pub {
+		return nil, false
+	}
+	return priv, true
+}
+
 func deviceKeypair() (ed25519.PrivateKey, string) {
 	if b, err := os.ReadFile(keyPath()); err == nil {
 		var kf keyFile
@@ -2030,7 +2114,11 @@ func deviceKeypair() (ed25519.PrivateKey, string) {
 			}
 		}
 	}
-	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	priv, taken := journalKey()
+	if !taken {
+		_, priv, _ = ed25519.GenerateKey(rand.Reader)
+	}
+	pub := priv.Public().(ed25519.PublicKey)
 	kf := keyFile{Seed: base64.StdEncoding.EncodeToString(priv.Seed()), Pub: base64.StdEncoding.EncodeToString(pub)}
 	if b, err := json.Marshal(kf); err == nil {
 		_ = os.MkdirAll(filepath.Dir(keyPath()), 0o700)
@@ -2059,8 +2147,15 @@ func signingString(r report) string {
 }
 
 func postReport(r report) bool {
-	if clevrURL == "" || clevrKey == "" {
-		fmt.Fprintln(os.Stderr, "--report needs CLEVR_URL and CLEVR_API_KEY.")
+	client := &http.Client{Timeout: 15 * time.Second}
+	bearer, err := "", errors.New("no engine")
+	if clevrURL != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		bearer, err = machineBearer(ctx, client, clevrURL, clevrKey)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "--report needs CLEVR_URL and CLEVR_API_KEY, or an enrolled machine whose custody answers (%v).\n", err)
 		return false
 	}
 	// Sign (best-effort — an unsigned report is still accepted, just marked unsigned).
@@ -2078,9 +2173,9 @@ func postReport(r report) bool {
 		fmt.Fprintln(os.Stderr, "Report failed:", err)
 		return false
 	}
-	req.Header.Set("Authorization", "Bearer "+clevrKey)
+	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("Content-Type", "application/json")
-	res, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Report failed:", err)
 		return false
@@ -2140,6 +2235,10 @@ func main() {
 	// --identify <path>: how this agent recognises one executable or application.
 	if hasArg("--identify") {
 		identifyAndExit()
+	}
+	// --enroll: enrol this machine, as root from deploy/mdm (enroll.go).
+	if hasArg("--enroll") {
+		os.Exit(runEnroll())
 	}
 	// --custody: hold session keys for the harness hooks (custody.go).
 	if hasArg("--custody") {

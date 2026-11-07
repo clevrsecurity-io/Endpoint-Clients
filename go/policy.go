@@ -8,6 +8,9 @@ package main
 // applies as it is: the floor the MDM installed, never less.
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,29 +53,56 @@ func readManagedSettings() map[string]any {
 	return nil
 }
 
-// Only the machine file's proxy is used: the person's proxy variables could
-// otherwise send the question nowhere and leave the machine on its floor.
-func policyTransport(proxy string) *http.Transport {
+// Only the machine file's proxy and CA file are used (CLEVR_PROXY,
+// CLEVR_CA_FILE, the names every Clevr client on the machine reads:
+// docs/integrate/network.mdx): the person's proxy variables could otherwise
+// send the question nowhere and leave the machine on its floor. A proxy
+// written without a scheme is http://; the CA file is added to the system's
+// roots, never put in their place.
+func policyTransport(proxy, caFile string) *http.Transport {
 	tr := &http.Transport{Proxy: nil}
 	if proxy != "" {
+		if !strings.Contains(proxy, "://") {
+			proxy = "http://" + proxy
+		}
 		if u, err := neturl.Parse(proxy); err == nil {
 			tr.Proxy = http.ProxyURL(u)
+		}
+	}
+	if caFile != "" {
+		if pem, err := os.ReadFile(caFile); err == nil {
+			pool, err := x509.SystemCertPool()
+			if err != nil || pool == nil {
+				pool = x509.NewCertPool()
+			}
+			if pool.AppendCertsFromPEM(pem) {
+				tr.TLSClientConfig = &tls.Config{RootCAs: pool}
+			}
 		}
 	}
 	return tr
 }
 
-func fetchPolicy(base, key, host, proxy string) (*policyAnswer, error) {
-	if base == "" || key == "" {
-		return nil, errors.New("no engine or key in the machine file")
+// The tier, asked with a machine token when the machine file names this
+// machine's id and its custody answers (machinetoken.go), else with the key.
+// Within six seconds in all: Claude Code gives the helper eight.
+func fetchPolicy(base, key, machineID, host, proxy, caFile string) (*policyAnswer, error) {
+	if base == "" {
+		return nil, errors.New("no engine in the machine file")
 	}
-	tr := policyTransport(proxy)
-	req, err := http.NewRequest("GET", strings.TrimRight(base, "/")+"/v1/endpoints/policy?host="+neturl.QueryEscape(host), nil)
+	client := &http.Client{Timeout: 5 * time.Second, Transport: policyTransport(proxy, caFile)}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	bearer, err := engineBearer(ctx, client, base, key, machineID, systemCustodySocketPath(), os.Stderr)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	res, err := (&http.Client{Timeout: 5 * time.Second, Transport: tr}).Do(req)
+	req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(base, "/")+"/v1/endpoints/policy?host="+neturl.QueryEscape(host), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +180,8 @@ func mergePolicy(profile, tier map[string]any, engineURL string) map[string]any 
 // the profile merged with the tier Clevr gives, or the profile alone.
 func effectiveSettings(profile map[string]any) (map[string]any, bool) {
 	host, _ := os.Hostname()
-	a, err := fetchPolicy(machineVar("CLEVR_URL"), machineVar("CLEVR_API_KEY"), host, machineVar("CLEVR_PROXY"))
+	base := machineVar("CLEVR_URL")
+	a, err := fetchPolicy(base, machineVar("CLEVR_API_KEY"), machineIDFor(base), host, machineVar("CLEVR_PROXY"), machineVar("CLEVR_CA_FILE"))
 	if err != nil || a.Tier == nil || a.Settings == nil {
 		return profile, false
 	}

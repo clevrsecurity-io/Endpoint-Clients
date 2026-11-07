@@ -28,6 +28,7 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -1228,8 +1229,26 @@ function buildReport () {
     // WHICH TIER IS ACTUALLY IN FORCE, not which one we sent. A local
     // administrator can remove an MDM profile, and a fleet dashboard that shows
     // the tier it deployed is showing its own intention.
-    tier: tierInForce()
+    tier: tierInForce(),
+    // The machine's own addresses, so a DNS server's log can be matched to it
+    // (clevr discover --dns-log --machines). Reported context, never signed.
+    addresses: localAddresses()
   }
+}
+
+// Every address the machine holds on an interface that is up: not the
+// loopback, not link-local, sorted, at most sixteen. The Go agent lists the same.
+function localAddresses () {
+  const out = new Set()
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const a of list || []) {
+      if (a.internal) continue
+      const ip = String(a.address).toLowerCase()
+      if (ip === '0.0.0.0' || ip === '::' || ip.startsWith('169.254.') || /^fe[89ab][0-9a-f]:/.test(ip)) continue
+      out.add(ip)
+    }
+  }
+  return [...out].sort().slice(0, 16)
 }
 
 // The managed-settings file the harness really reads, at the paths Anthropic
@@ -1247,7 +1266,7 @@ const LEGACY_WIN = 'C:\\ProgramData\\ClaudeCode\\managed-settings.json'
 // (deploy/mdm), the person's own setup, or nowhere. A machine file with no key
 // means every action is refused there.
 function hooksKey () {
-  if (MACHINE) return MACHINE.CLEVR_API_KEY ? 'machine' : 'missing'
+  if (MACHINE) return MACHINE.CLEVR_API_KEY || MACHINE.CLEVR_MACHINE_ID ? 'machine' : 'missing'
   try {
     const c = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.clevr', 'config.json'), 'utf8'))
     if (typeof c.key === 'string' && c.key) return 'person'
@@ -2063,6 +2082,27 @@ const KEY_PATH = path.join(os.homedir(), '.clevr', 'endpoint-key.json')
 // RFC 8410 PKCS8 prefix for a raw 32-byte Ed25519 seed. We persist the SEED (not
 // PKCS8) so the Node and Go agents derive the SAME key from the SAME file.
 const PKCS8_ED25519_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex')
+// The Clevr daemon's journal key (brain/src/local/journal.ts), in the same
+// format. A machine where the daemon made its key before this agent made one
+// takes it, so the reports and the journal are signed by one key the centre
+// reads on both (docs-internal/fusion-agent-de-poste-2026-10-31.md). Only a
+// plain file of this account that no one else can read, whose public half is
+// its seed's; on Windows the mode is not read. The Go agent reads it the same way.
+const JOURNAL_KEY_PATH = path.join(os.homedir(), '.clevr', 'local', 'journal-key.json')
+function journalKeyOf () {
+  try {
+    const st = fs.lstatSync(JOURNAL_KEY_PATH)
+    if (!st.isFile()) return null
+    if (process.platform !== 'win32' && ((st.mode & 0o077) || (typeof process.getuid === 'function' && st.uid !== process.getuid()))) return null
+    const j = JSON.parse(fs.readFileSync(JOURNAL_KEY_PATH, 'utf8'))
+    const seed = typeof j.seed === 'string' ? Buffer.from(j.seed, 'base64') : null
+    if (!seed || seed.length !== 32) return null
+    const priv = crypto.createPrivateKey({ key: Buffer.concat([PKCS8_ED25519_PREFIX, seed]), format: 'der', type: 'pkcs8' })
+    const spki = crypto.createPublicKey(priv).export({ format: 'der', type: 'spki' })
+    const pub = spki.subarray(spki.length - 32).toString('base64')
+    return j.pub === pub ? { priv, seed: seed.toString('base64'), pub } : null
+  } catch { return null }
+}
 function deviceKeypair () {
   try {
     const j = JSON.parse(fs.readFileSync(KEY_PATH, 'utf8'))
@@ -2072,6 +2112,11 @@ function deviceKeypair () {
       return { priv, pub: j.pub }
     }
   } catch {}
+  const journal = journalKeyOf()
+  if (journal) {
+    try { fs.mkdirSync(path.dirname(KEY_PATH), { recursive: true }); fs.writeFileSync(KEY_PATH, JSON.stringify({ seed: journal.seed, pub: journal.pub }), { mode: 0o600 }) } catch {}
+    return { priv: journal.priv, pub: journal.pub }
+  }
   const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519')
   const der = privateKey.export({ format: 'der', type: 'pkcs8' })   // 48B = 16-byte prefix + 32-byte seed
   const seed = der.subarray(der.length - 32).toString('base64')
@@ -2088,8 +2133,43 @@ function signingString (r) {
   return [r.host, r.ts, r.version, String(s.running || 0), String(s.monitored || 0), String(s.shadow || 0), sigs.join(',')].join('\n')
 }
 
+// The machine's token, where the machine was enrolled and its custody runs as a
+// system service (docs-internal/SPEC-MACHINE-KEY-LOT3-2026-11-06.md): a
+// challenge bound to the machine, signed by its key in the custody, then a token
+// good ten minutes that stands for the machine's key. The key otherwise.
+const CUSTODY_SOCK = process.platform === 'darwin' ? '/Library/Application Support/Clevr/custody.sock'
+  : process.platform === 'linux' ? '/run/clevr/custody.sock' : process.platform === 'win32' ? '\\\\.\\pipe\\clevr-custody-system' : null
+function askCustody (req) {
+  return new Promise((resolve) => {
+    let buf = '', done = false
+    const end = (v) => { if (!done) { done = true; try { sock.destroy() } catch { /* closed */ } resolve(v) } }
+    const sock = net.createConnection(CUSTODY_SOCK)
+    sock.setTimeout(2000, () => end(null))
+    sock.on('error', () => end(null))
+    sock.on('connect', () => sock.write(JSON.stringify(req) + '\n'))
+    sock.on('data', (d) => { buf += d; const i = buf.indexOf('\n'); if (i >= 0) { try { end(JSON.parse(buf.slice(0, i))) } catch { end(null) } } })
+    sock.on('end', () => end(null))
+  })
+}
+async function engineBearer () {
+  const mid = MACHINE?.CLEVR_MACHINE_ID
+  if (!mid || !CUSTODY_SOCK) return CLEVR_KEY
+  const post = async (p, body) => {
+    try {
+      const r = await fetch(`${CLEVR_URL}${p}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(5000) })
+      return r.ok ? await r.json() : null
+    } catch { return null }
+  }
+  const c = await post('/v1/machines/token/challenge', { machine_id: mid })
+  const s = c && typeof c.challenge === 'string' ? await askCustody({ op: 'machine_sign', purpose: 'token', challenge: c.challenge, machine_id: mid }) : null
+  const t = s && typeof s.sig === 'string' ? await post('/v1/machines/token', { machine_id: mid, challenge: c.challenge, sig: s.sig }) : null
+  return (t && typeof t.access_token === 'string' ? t.access_token : '') || CLEVR_KEY
+}
+
 async function postReport (report) {
-  if (!CLEVR_URL || !CLEVR_KEY) { console.error('--report needs CLEVR_URL and CLEVR_API_KEY.'); return false }
+  if (!CLEVR_URL || (!CLEVR_KEY && !MACHINE?.CLEVR_MACHINE_ID)) { console.error('--report needs CLEVR_URL and CLEVR_API_KEY (or an enrolled machine).'); return false }
+  const bearer = await engineBearer()
+  if (!bearer) { console.error('Report failed: the machine\'s custody gave no token and the machine file holds no key.'); return false }
   let body = report
   try {
     const kp = deviceKeypair()
@@ -2099,7 +2179,7 @@ async function postReport (report) {
   try {
     const res = await fetch(`${CLEVR_URL}/v1/endpoints`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${CLEVR_KEY}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     })
     console.log(res.ok ? `Reported to Clevr (${res.status}).` : `Report failed: HTTP ${res.status} ${await res.text()}`)

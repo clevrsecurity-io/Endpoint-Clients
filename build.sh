@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build standalone single-file executables of the Clevr endpoint agent for macOS
 # (arm64 + Intel), Windows (x64) and Linux (x64) — NO runtime required on the target
-# machine. Written in Go (stdlib only), so each binary is a ~6 MB static executable
+# machine. Written in Go (the standard library, and golang.org/x/sys for the
+# Windows service), so each binary is a ~6 MB static executable
 # with nothing to install. Output goes to dist/ (gitignored). Cross-compiles from
 # any host (pure Go, CGO off).
 #

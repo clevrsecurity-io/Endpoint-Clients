@@ -74,7 +74,8 @@ func machineVar(name string) string {
 
 func hooksKey() string {
 	if machineVars != nil {
-		if machineVars["CLEVR_API_KEY"] != "" {
+		// A key, or an enrolled machine's id: its hooks present machine tokens.
+		if machineVars["CLEVR_API_KEY"] != "" || machineVars["CLEVR_MACHINE_ID"] != "" {
 			return "machine"
 		}
 		return "missing"

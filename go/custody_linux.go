@@ -13,7 +13,8 @@ import (
 	"syscall"
 )
 
-// The pid at the other end of a local socket, from the kernel (SO_PEERCRED).
+// The pid at the other end of a local socket, from the kernel (SO_PEERCRED):
+// a process of this account, or of any account for the system custody.
 func peerPID(conn net.Conn) (int, error) {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
@@ -30,7 +31,7 @@ func peerPID(conn net.Conn) (int, error) {
 			gerr = e
 			return
 		}
-		if int(cred.Uid) != os.Getuid() {
+		if !peerAnyAccount && int(cred.Uid) != os.Getuid() {
 			gerr = errors.New("another user")
 			return
 		}
